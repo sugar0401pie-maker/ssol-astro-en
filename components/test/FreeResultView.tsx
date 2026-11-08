@@ -1,0 +1,892 @@
+"use client";
+
+// 결과 화면 — 2026-10-09 프로토타입 renderResult() 마크업·문구 그대로(owner 2026-10-10 "html과 완전히 동일하게").
+// 머리 → 1. 태어난 순간의 하늘(정확도·시간 추가·휠·표·4원소·나의 행성 읽기) → 2. 별이 본 나의 유형(동점이면 고르기) →
+// 3. 2026 회고 → [SNS 공유하기][저장하기] → 4~7(잠김: 요약 + 앞부분만, 결제 후 전체) → 부드러운 톤 카드 → 공유·저장 → 고지.
+// 1~3번 문장은 서버가 해석 DB에서 골라 보낸다(AI 0회). 4~7번 본문은 결제 전에는 브라우저로 보내지 않는다.
+import { ReportWriting } from "@/components/results/ReportWriting";
+import SowellaButton from "@/components/results/SowellaButton";
+import PageArt from "@/components/results/PageArt";
+import { RESULT_PAGES, rememberPage } from "@/lib/results/lastPage";
+import Link from "next/link";
+import { KeyText } from "@/components/en/KeyParagraph";
+import { isKeyParagraph } from "@/lib/en/emphasis";
+import { swipeDirection } from "@/lib/ui/swipe";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { createPortal } from "react-dom";
+import { track } from "@/lib/analytics/track";
+import { REPORT_PRICE } from "@/lib/billing/pricing";
+import { apiHeaders } from "@/lib/guest/client";
+import { getRealSession } from "@/lib/supabase/browser";
+import Wheel from "@/components/chart/Wheel";
+import { PLANET_GLYPHS, POINT_NAMES } from "@/components/chart/labels";
+import ActionRow from "@/components/share/ActionRow";
+import BottomSheet from "@/components/ui/BottomSheet";
+import Toast, { useToast } from "@/components/ui/Toast";
+import { WhyList } from "@/components/results/PaidReportView";
+import type { PointKey } from "@/lib/astro/constants";
+import type { FreeResult, WheelSheet } from "@/lib/report/freeResult";
+import { EN as LEN, KO as LKO } from "@/lib/report/lang";
+import ActionRowEn from "@/components/en/ActionRowEn";
+
+const noopSubscribe = () => () => {};
+const SESSION_URL = "https://app.ssolwellnesshouse.com/session-reserve";
+/** 3장 웰니스 상담 기본 안내(부드러운 톤이 아닐 때) — Claude 초안, owner 검토 가능. 공포·재촉 표현 없이 */
+/** 1~6장 끝 짧은 고지(owner 2026-10-12 B — 전체 고지문 A15 FIX_DISCLAIMER는 7장 끝에 그대로) */
+const SHORT_DISCLAIMER = "점성술은 예측 도구가 아니에요. 이 결과는 나를 돌아보기 위한 웰니스 콘텐츠예요.";
+const WELLNESS_SESSION_NOTE =
+  "별 리포트로 돌아본 한 해를 사람과 함께 천천히 이야기해 보고 싶다면, 쏠 웰니스 하우스의 웰니스 상담을 이용해 보세요. {닉네임}님의 지금 마음을 함께 살펴보고, 나에게 맞는 속도를 함께 찾아가 볼 수 있어요.";
+const SIGN_NAMES = ["양자리", "황소자리", "쌍둥이자리", "게자리", "사자자리", "처녀자리", "천칭자리", "전갈자리", "사수자리", "염소자리", "물병자리", "물고기자리"];
+const ELEM_ORDER = ["불", "흙", "공기", "물"] as const;
+const ELEM_SHADE: Record<string, string> = { 불: "#013566", 흙: "#2B5486", 공기: "#5878A3", 물: "#8AA0C2" };
+const TABLE_KEYS: PointKey[] = ["sun", "moon", "mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune", "pluto"];
+
+// 화면 고정 문구(영문판 2026-11-04, 결과 화면은 (가) — 같은 화면을 언어만 바꿔 쓴다). en은 번역 묶음
+// 영문번역_화면문구·안내 › UI 시트 그대로, 그 시트에 없는 몇 줄(★)만 Claude 초안(원어민 검수 대상).
+const KO_T = {
+  sec1: (n: string) => `${n}님이 태어난 순간의 하늘`,
+  sec2: "별이 본 나의 유형",
+  sec3: (n: string) => `2026년, ${n}님의 한 해는 이랬어요`,
+  topics: "결과 주제",
+  eyebrow: "쏠 아스트로 하우스 · 별 리포트",
+  editTimeAria: "태어난 시간 수정",
+  edit: "수정",
+  tipAria: (n: number) => `휠 읽는 법 ${n}/3`,
+  tipHead: (n: number) => `휠 읽는 법 ${n}/3 · ${TIP_STEP[n]}`,
+  close: "닫기",
+  next: "다음",
+  ok: "확인",
+  tapHint: "행성이나 별자리 칸을 눌러 보세요.",
+  mainLines: "주요 선만 보기",
+  allLines: "모든 선 보기",
+  tableSummary: "표로 보기 (행성 / 별자리 / 하우스)",
+  tableCaption: "출생차트 행성 위치",
+  thPlanet: "행성",
+  thSign: "별자리",
+  thHouse: "하우스",
+  aspCaption: "행성 사이의 각도",
+  thAspect: "각도",
+  thMeaning: "뜻",
+  wholeSign: (utc: string) => `하우스는 홀사인 기준이에요. 출생 시각은 ${utc}로 계산했어요.`,
+  elements: "4원소의 균형",
+  elemAria: (e: string, v: number, strong: boolean) => `${e} ${v}점${strong ? ", 가장 강함" : ""}`,
+  elemPoints: "태양·달 3점, 수성·금성·화성 2점, 목성·토성 1점",
+  planetsHead: "• 나의 행성 읽기",
+  aspectsHead: "• 행성끼리의 관계",
+  tieHead: "요즘의 나와 더 가까운 건?",
+  legacyPick: (c: string, st: string) => `지금 결과는 예전에 고르신 ${c} × ${st} 유형으로 보여요. 아래에서 다시 고를 수도 있어요.`,
+  big3Caption: "태양·달·상승궁 한 줄 해석",
+  thCard: "카드",
+  thLine: "한 줄 해석",
+  turning: "• 올해의 전환점",
+  quarterHead: "• 분기별로 돌아보면",
+  q2026Caption: "2026년 분기별 회고",
+  thPeriod: "시기",
+  forYou: (n: string) => `${n}님에게는`,
+  skyHappened: "▸ 하늘에서 일어난 일",
+  shareNote: "결제하지 않더라도 지금까지의 결과를 공유할 수 있어요.",
+  prev: "‹ 이전",
+  nextStory: "다음 이야기 ›",
+  first: "처음 주제로 돌아가기",
+  endNote: "별 리포트를 끝까지 읽었어요.",
+  myResults: "내 결과 모아 보기",
+  saveToPay: "결과를 저장하면 전체 리포트를 볼 수 있어요.",
+  payAria: "결제 안내",
+  payButton: `${REPORT_PRICE.toLocaleString("ko-KR")}원 결제하기`,
+  saveFail: "결과를 저장하지 못했어요. 잠시 뒤 다시 눌러 주세요.",
+  saveFirst: "결제하려면 먼저 결과를 저장해야 해요. 버튼을 누르면 저장부터 해 볼게요.",
+  switched: "고르신 유형으로 리포트를 다시 맞췄어요",
+  switchFail: "바꾸지 못했어요.",
+  shortDisclaimer: SHORT_DISCLAIMER,
+};
+type ViewT = typeof KO_T;
+const EN_TIP_STEP = ["", "Outer ring = signs", "Circle = planet", "Line = how planets relate"];
+const EN_T: ViewT = {
+  sec1: (n) => `${n} — the sky at the moment you were born`,
+  sec2: "Your type, as the stars see it",
+  sec3: (n) => `2026: ${n}’s year went like this`,
+  topics: "Chapters",
+  eyebrow: "SSOL Astro House · Star report",
+  editTimeAria: "Edit your birth time", // ★
+  edit: "Edit", // ★
+  tipAria: (n) => `How to read the wheel ${n}/3`,
+  tipHead: (n) => `How to read the wheel ${n}/3 · ${EN_TIP_STEP[n]}`,
+  close: "Close", // ★
+  next: "Next", // ★
+  ok: "Got it", // ★
+  tapHint: "Tap a planet or a sign to explore.",
+  mainLines: "Show main lines only",
+  allLines: "Show all lines",
+  tableSummary: "View as a table (planet / sign / house)",
+  tableCaption: "Planet positions in your birth chart",
+  thPlanet: "Planet", // ★
+  thSign: "Sign", // ★
+  thHouse: "House",
+  aspCaption: "Angles between planets", // ★
+  thAspect: "Aspect", // ★
+  thMeaning: "Meaning", // ★
+  wholeSign: (utc) => `Houses use the Whole Sign system. Your birth time was calculated as ${utc}.`,
+  elements: "Balance of the four elements",
+  elemAria: (e, v, strong) => `${e} ${v} pts${strong ? ", strongest" : ""}`,
+  elemPoints: "Sun & Moon 3 pts · Mercury, Venus & Mars 2 pts · Jupiter & Saturn 1 pt",
+  planetsHead: "• Your planets, decoded",
+  aspectsHead: "• How your planets get along",
+  tieHead: "Which sounds more like you these days?",
+  legacyPick: (c, st) => `This result uses the ${c} × ${st} type you chose earlier. You can choose again below.`, // ★
+  big3Caption: "One-line readings for your Sun, Moon and Ascendant",
+  thCard: "Card",
+  thLine: "One-line reading",
+  turning: "• This year’s turning point",
+  quarterHead: "• Your year, quarter by quarter",
+  q2026Caption: "Looking back on 2026, quarter by quarter",
+  thPeriod: "Period",
+  forYou: (n) => `${n}, for you`,
+  skyHappened: "▸ What happened in the sky",
+  shareNote: "You can share your reading so far, no payment needed.",
+  prev: "‹ Back",
+  nextStory: "Next story ›",
+  first: "Back to the first topic",
+  endNote: "You’ve reached the end of your star report.",
+  myResults: "See all my results", // ★
+  saveToPay: "Save your results to unlock the full report.", // ★
+  payAria: "Payment", // ★
+  payButton: "Pay US$2.99 and get my report now",
+  saveFail: "We couldn’t save your results. Please try again in a moment.", // ★
+  saveFirst: "Your results need to be saved before you pay. Tap the button and we’ll save them first.", // ★
+  switched: "Your report now matches the type you chose",
+  switchFail: "We couldn’t change it.", // ★
+  shortDisclaimer: "Astrology is not a prediction tool. These results are wellness content for self-reflection.", // ★
+};
+
+/** 섹션 틀(프로토타입 sec): '무료'/'유료' 표시는 하지 않는다(2026-10-09) */
+export function Section({ no, title, art, children }: { no: number; title: string; art?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <section className="rsec" id={`sec-${no}`} aria-labelledby={`sec-${no}-t`}>
+      <h2 className="rsec-title" id={`sec-${no}-t`} tabIndex={-1}>
+        <span>{title}</span>
+      </h2>
+      {art}
+      {children}
+    </section>
+  );
+}
+
+/** 굵은 한 줄 요약(.lead.summary, B11 SUM_*) */
+export function Summary({ text }: { text: string | null | undefined }) {
+  return text ? <p className="lead summary">{text}</p> : null;
+}
+
+function SheetBody({ sheet }: { sheet: WheelSheet }) {
+  return (
+    <>
+      <h3 id="sheet-title">
+        {sheet.glyph && <span className="sym">{sheet.glyph}︎ </span>}
+        {sheet.title}
+      </h3>
+      {sheet.kicker && <p className="kicker">{sheet.kicker}</p>}
+      {sheet.paras.map((p, i) => (
+        <p key={i}>
+          {p.b && <b>{p.b}</b>} {p.t}
+        </p>
+      ))}
+      {sheet.muted && <p className="muted">{sheet.muted}</p>}
+    </>
+  );
+}
+
+// 휠 읽는 법(프로토타입 showTip): 처음인 사람에게 한 번 — 닫으면 이 기기에 기억(localStorage, 스펙 "한 번 닫으면 다시 안 뜸")
+const TIPS_KEY = "sol_wheel_tips";
+const TIP_STEP = ["", "바깥 고리 = 별자리", "동그라미 = 행성", "선 = 행성끼리의 관계"];
+const TIP_TOP = ["", "-4px", "30%", "58%"];
+function tipsSeen(): boolean {
+  try {
+    return localStorage.getItem(TIPS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** B11 PAY_POPUP "안내 · 덧붙임 · [버튼]" → 조각 */
+function splitPayPopup(text: string): { message: string; sub: string; button: string } {
+  const button = text.match(/\[([^\]]+)\]/)?.[1] ?? "";
+  const parts = text.replace(/\s*·?\s*\[[^\]]+\]\s*$/, "").split(" · ").map((x) => x.trim()).filter(Boolean);
+  return { message: parts[0] ?? "", sub: parts.slice(1).join(" · "), button };
+}
+
+export default function FreeResultView({
+  result,
+  nickname,
+  firstTime,
+  resultId,
+  paidSection,
+  initialPage,
+  onRetrySave,
+  tempBanner,
+  tempNote,
+  onAddTime,
+  paidPending,
+  savePrefill,
+  onResult,
+  lang = "ko",
+}: {
+  result: FreeResult;
+  nickname: string;
+  firstTime: boolean;
+  /** 저장된 결과 id — 있으면 결제 버튼이 결제 화면으로 간다 */
+  resultId?: string | null;
+  /** 결제 후 유료 섹션(4~7) 하나를 그리는 함수(있으면 잠긴 미리보기 대신 보여 준다) */
+  paidSection?: (no: number) => React.ReactNode;
+  /** 임시 계정으로 결제한 사람: 4~7장 맨 위 보관 안내(프로토타입 .temp-banner) */
+  tempBanner?: (page: number) => React.ReactNode;
+  /** 임시 계정으로 결제한 사람에게만(ResultView가 넘김): 4~7장 맨 위 B11 PAY_TEMP_NOTE — owner 2026-10-26, 결제 팝업에서 옮김 */
+  tempNote?: string;
+  /** 저장이 실패한 결과를 다시 저장해 보기(성공하면 true) — 테스트 흐름에서만 */
+  onRetrySave?: () => Promise<boolean>;
+  /** 처음 열 페이지(1~7, 패키지 v3 웹툰식 결과) */
+  initialPage?: number;
+  /** B·C등급 태어난 시간 [수정] */
+  onAddTime?: () => void;
+  /** 결제는 끝났고 리포트를 쓰는 중 — 잠긴 자리를 그대로 두고 안내만 바꾼다 */
+  /** 결제 후 리포트를 쓰는 중: 잠긴 섹션 가운데에 도는 별 + 바뀌는 문구(slowText = 오래 걸릴 때 고정 안내) */
+  paidPending?: { slowText: string | null };
+  /** 저장하기 → 가입할 때 미리 채울 값 */
+  savePrefill?: { birthDate?: string; nickname?: string };
+  /** 2번 섹션에서 유형을 바꿨을 때 새 결과 */
+  onResult?: (r: FreeResult) => void;
+  /** 영문판(/en/results) — 결과 내용은 서버가 영문 DB로 만들어 보낸다. 여기서는 화면 고정 문구와 이름(별자리·각도 등)만 바꾼다 */
+  lang?: "ko" | "en";
+}) {
+  const en = lang === "en";
+  const T = en ? EN_T : KO_T;
+  const L = en ? LEN : LKO;
+  const pointName = (k: PointKey) => (en ? L.point(k) : POINT_NAMES[k]);
+  const [sheetKey, setSheetKey] = useState<string | null>(null);
+  const [showAll, setShowAll] = useState(false);
+  const [tip, setTip] = useState(() => (tipsSeen() ? 0 : 1));
+  const [toast, setToast] = useToast();
+  const [switching, setSwitching] = useState(false);
+  // 결제 전: 유료 섹션의 굵은 요약 + 본문 첫 두 문장(서버가 DB 뼈대에서 그만큼만 보냄) + 흐린 자리용 B13 가짜 문장
+  const [preview, setPreview] = useState<Record<number, { first: string; lines: string[]; dummy: string[] }>>({});
+  // 로그인하지 않은(임시 계정) 사람에게만 3장 끝 로그인 권유 한 줄
+  const [loggedIn, setLoggedIn] = useState(true);
+  useEffect(() => {
+    void getRealSession().then((s) => setLoggedIn(!!s));
+  }, []);
+  const wantPreview = !paidSection && !!resultId;
+  // 유형을 바꾸면 4~7장 미리보기 문장도 새 유형 기준으로 다시 받는다
+  const typeKey = `${result.character.competency}|${result.character.style}`;
+  useEffect(() => {
+    if (!wantPreview) return;
+    let alive = true;
+    void getRealSession()
+      .then(async (session) => {
+        const res = await fetch(`/api/results/${resultId}/preview`, { headers: apiHeaders(session) });
+        if (!res.ok || !alive) return;
+        const data = (await res.json()) as { sections: Array<{ no: number; first: string; lines?: string[]; dummy?: string[] }> };
+        setPreview(Object.fromEntries(data.sections.map((x) => [x.no, { first: x.first, lines: x.lines ?? [], dummy: x.dummy ?? [] }])));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [wantPreview, resultId, typeKey]);
+
+  // 웹툰식 주제별 페이지(패키지 v3): 한 번에 한 주제만. 페이지마다 주소(/results/{id}/{n})와 '마지막으로 보던 페이지'를 남겨
+  // 결제하고 돌아오거나 [내 결과 보기]로 들어와도 그 페이지로 연다.
+  const rootRef = useRef<HTMLDivElement>(null);
+  // portal은 브라우저에서만(서버에서 그린 화면과 어긋나지 않게)
+  const mounted = useSyncExternalStore(noopSubscribe, () => true, () => false);
+  const [page, setPage] = useState(() => Math.min(Math.max(1, initialPage ?? 1), RESULT_PAGES));
+  // 이용 흐름 기록: 어느 장까지 읽는지(장마다 한 번), 결제 카드가 보였는지
+  useEffect(() => {
+    track("result_view", { page }, `result_view:${resultId ?? "unsaved"}:${page}`);
+    if (page >= 4 && !paidSection) track("paywall_view", { page }, `paywall_view:${resultId ?? "unsaved"}`);
+  }, [page, resultId, paidSection]);
+  useEffect(() => {
+    if (!resultId) return;
+    const t = setTimeout(() => {
+      void getRealSession()
+        .then((session) => fetch(`/api/results/${resultId}`, { method: "PATCH", headers: apiHeaders(session, { "content-type": "application/json" }), body: JSON.stringify({ lastPage: page }) }))
+        .catch(() => {});
+    }, 1000);
+    return () => clearTimeout(t);
+  }, [resultId, page]);
+  useEffect(() => {
+    if (!resultId) return;
+    rememberPage(resultId, page);
+    // 테스트 직후 결과(/test/result)도 저장이 끝나면 장마다 /results/{id}/{n} 주소로(owner 2026-10-10) — 새로고침·공유된 주소로 다시 열어도 그 장
+    const path = window.location.pathname;
+    if (path.startsWith("/results/") || path === "/test/result" || path.startsWith("/results/")) {
+      const url = `/results/${resultId}/${page}`;
+      if (path !== url) window.history.replaceState(null, "", url);
+    }
+  }, [resultId, page, en]);
+  function go(n: number) {
+    setPage(n);
+    requestAnimationFrame(() => {
+      const top = (rootRef.current?.getBoundingClientRect().top ?? 0) + window.scrollY - 8;
+      window.scrollTo({ top: Math.max(0, top), behavior: "auto" });
+      document.getElementById(`sec-${n}-t`)?.focus({ preventScroll: true });
+    });
+  }
+
+  // 장 넘기기 스와이프(owner 2026-11-04). 표·휠·가로로 밀리는 칸·입력칸·아래 시트 위에서 시작한 손가락은 무시
+  const touch = useRef<{ x: number; y: number; t: number } | null>(null);
+  function onTouchStart(e: React.TouchEvent) {
+    const el = e.target as HTMLElement;
+    if (e.touches.length !== 1 || el.closest("input, textarea, select, .wheel-wrap, .tbl, table, .sheet, [role=dialog], .pg-bar")) {
+      touch.current = null;
+      return;
+    }
+    for (let n: HTMLElement | null = el; n && n !== rootRef.current; n = n.parentElement) {
+      const ox = getComputedStyle(n).overflowX;
+      if ((ox === "auto" || ox === "scroll") && n.scrollWidth > n.clientWidth) {
+        touch.current = null;
+        return;
+      }
+    }
+    touch.current = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
+  }
+  function onTouchEnd(e: React.TouchEvent) {
+    const s = touch.current;
+    touch.current = null;
+    if (!s || e.changedTouches.length !== 1) return;
+    const dir = swipeDirection(e.changedTouches[0].clientX - s.x, e.changedTouches[0].clientY - s.y, Date.now() - s.t);
+    if (dir === "next" && page < RESULT_PAGES) go(page + 1);
+    else if (dir === "prev" && page > 1) go(page - 1);
+  }
+
+  const { chart, character, year2026 } = result;
+  const P = chart.planets;
+  const withTime = !!P.asc;
+  const popup = splitPayPopup(result.payPopup ?? "");
+  // 영문판 주요 문장 굵게(owner 2026-11-04): 장마다 문단 순서대로 세어 두 문단마다 첫 문장 하나
+  let keyN = 0;
+  const kp = (t: string) => <KeyText text={t} emph={en && isKeyParagraph(keyN++)} />;
+  const share = { chart, sunSign: result.sunSign, sunSignIndex: result.sunSignIndex, typeLine: character.name ?? character.typeLine, competency: character.competency, style: character.style, nickname, sunSignIntro: result.sunSignIntro ?? null };
+
+  const sheet: WheelSheet | null = !sheetKey
+    ? null
+    : sheetKey.startsWith("sign:")
+      ? result.wheelSheets.signs[SIGN_NAMES[Number(sheetKey.slice(5))]] ?? null
+      : sheetKey.startsWith("asp:")
+        ? result.wheelSheets.lines[sheetKey.slice(4)] ?? null
+        : result.wheelSheets.planets[sheetKey as PointKey] ?? null;
+
+  function endTips() {
+    setTip(0);
+    try {
+      localStorage.setItem(TIPS_KEY, "1");
+    } catch {
+      /* 저장소를 못 쓰면 다음에 다시 보여도 괜찮다 */
+    }
+  }
+
+  async function chooseType(comp: string, style: string) {
+    if (!resultId || switching) return;
+    setSwitching(true);
+    try {
+      const session = await getRealSession();
+      const res = await fetch(`/api/results/${resultId}`, { method: "PATCH", headers: apiHeaders(session, { "content-type": "application/json" }), body: JSON.stringify({ typePick: { competency: comp, style } }) });
+      const data = await res.json();
+      if (!res.ok || !data.result) throw new Error(en ? T.switchFail : (data.error ?? T.switchFail));
+      const y = (document.getElementById("sec-2")?.getBoundingClientRect().top ?? 0) + window.scrollY;
+      onResult?.(data.result);
+      requestAnimationFrame(() => window.scrollTo(0, y - 10));
+      setToast(T.switched);
+    } catch (e) {
+      setToast(e instanceof Error ? e.message : T.switchFail);
+    } finally {
+      setSwitching(false);
+    }
+  }
+
+
+  const titles = [
+    T.sec1(nickname),
+    T.sec2,
+    T.sec3(nickname),
+    ...[4, 5, 6, 7].map((no) => (result.paidSections.find((x) => x.no === no)?.title ?? "").replace("{닉네임}", nickname)),
+  ];
+  const lockedPage = page >= 4 && !paidSection;
+  // 고지문(마스터스펙 8-1 '결과 하단 고정 고지' — 안전 원칙상 없애지 않는다): owner 2026-10-10 요청으로 장마다 보이던 것을
+  // 프로토타입처럼 마지막 장(7장) 끝에만. '상담사 검수 전 초안' 표시는 owner 요청으로 숨김.
+  // owner 2026-10-12(B): 1~3장만 보고 나가는 사람도 볼 수 있게 1~6장 끝에는 짧은 한 줄, 7장에는 전체 고지문.
+  const disclaimer =
+    page === RESULT_PAGES ? (
+      <p className="disclaimer">{result.disclaimer}</p>
+    ) : (
+      <p className="disclaimer" style={{ fontSize: ".74rem", opacity: 0.8 }}>
+        {T.shortDisclaimer}
+      </p>
+    );
+  const next = page < RESULT_PAGES ? page + 1 : null;
+
+  return (
+    <div ref={rootRef} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+      {/* 위쪽 고정 진행 막대: 주제 수만큼 칸, 칸을 누르면 그 주제로 */}
+      <div className="pg-bar">
+        <div className="pg-dots" role="tablist" aria-label={T.topics}>
+          {titles.map((t, i) => (
+            <button key={i} type="button" role="tab" aria-label={`${i + 1}. ${t}`} aria-selected={page === i + 1} className={page === i + 1 ? "cur" : i + 1 < page ? "done" : ""} onClick={() => go(i + 1)} />
+          ))}
+        </div>
+        <div className="pg-meta">
+          <span>{titles[page - 1]}</span>
+          <span>
+            {page} / {RESULT_PAGES}
+          </span>
+        </div>
+      </div>
+
+      <div key={page} className={`rpage${lockedPage && !paidPending ? " has-locked" : ""}`}>
+        {page === 1 && (
+          <>
+          <header className="res-head">
+            <p className="eyebrow">{T.eyebrow}</p>
+            <h1 className="big" id="res-title">
+              {result.header.title}
+            </h1>
+            {result.header.line && <p className="small">{result.header.line}</p>}
+          </header>
+
+
+            {/* ===== 1. 태어난 순간의 하늘 ===== */}
+          <Section no={1} title={T.sec1(nickname)} art={<PageArt page={1} signIndex={result.sunSignIndex} />}>
+            {/* 정확도 배지: owner 2026-10-11 모든 등급 숨김(시간을 모를 때는 아래 안내와 [수정]이 한계를 알린다) */}
+            {/* 서머타임 경계(시간은 알지만 1시간 차이가 날 수 있음)는 [수정] 안내가 없으므로 등급 글자 없이 안내 문장만 */}
+            {!result.addTimeNote && result.accuracy !== "A" && result.gradeNote && <p className="small">{result.gradeNote}</p>}
+            {result.addTimeNote && (
+              <div className="grade" style={{ alignItems: "center" }}>
+                <div>{result.addTimeNote}</div>
+                {onAddTime && (
+                  <button className="btn ghost small-btn" type="button" onClick={onAddTime} style={{ whiteSpace: "nowrap", flexShrink: 0 }} aria-label={T.editTimeAria}>
+                    {T.edit}
+                  </button>
+                )}
+              </div>
+            )}
+            <div className="wheel-wrap" id="wheel-wrap">
+              <Wheel chart={chart} aspects={result.wheelAspects} retro={result.retro} showAll={showAll} tipStep={tip} onSelect={setSheetKey} lang={lang} />
+              {tip > 0 && result.wheelTips[tip - 1] && (
+                <div className="tip" id="wheel-tip" role="dialog" aria-label={T.tipAria(tip)} style={{ top: TIP_TOP[tip] }}>
+                  <p className="tip-step">
+                    {T.tipHead(tip)}
+                  </p>
+                  <p>{result.wheelTips[tip - 1]}</p>
+                  <div className="tip-btns">
+                    <button className="btn ghost" type="button" onClick={endTips}>
+                      {T.close}
+                    </button>
+                    <button className="btn" type="button" onClick={() => (tip < 3 ? setTip(tip + 1) : endTips())}>
+                      {tip < 3 ? T.next : T.ok}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="wheel-tools">
+              <span className="hint" style={{ margin: 0 }}>
+                {T.tapHint}
+              </span>
+              <button className="btn ghost small-btn" type="button" aria-pressed={showAll} onClick={() => setShowAll((v) => !v)}>
+                {showAll ? T.mainLines : T.allLines}
+              </button>
+            </div>
+            <details className="night-details" id="chart-table">
+              <summary>{T.tableSummary}</summary>
+              <table className="tbl t3">
+                <caption className="sr-only">{T.tableCaption}</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">{T.thPlanet}</th>
+                    <th scope="col">{T.thSign}</th>
+                    <th scope="col">{T.thHouse}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...TABLE_KEYS, ...(withTime ? (["asc", "mc"] as PointKey[]) : [])].map((k) => {
+                    const p = P[k];
+                    if (!p) return null;
+                    return (
+                      <tr key={k}>
+                        <td>
+                          {pointName(k)}
+                          {k === "asc" ? " (ASC)" : k === "mc" ? " (MC)" : ""}
+                        </td>
+                        <td>
+                          {L.sign(p.sign)} {p.deg.toFixed(1)}°{result.retro.includes(k) && <span className="sub">{L.retro}</span>}
+                        </td>
+                        <td>{withTime ? L.house(p.house!) : "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              {result.wheelAspects.length > 0 && (
+                <table className="tbl t3" style={{ marginTop: 14 }}>
+                  <caption className="sr-only">{T.aspCaption}</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">{T.thPlanet}</th>
+                      <th scope="col">{T.thAspect}</th>
+                      <th scope="col">{T.thMeaning}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.wheelAspects.map((a, i) => (
+                      <tr key={i}>
+                        <td>
+                          {pointName(a.a)}–{pointName(a.b)}
+                        </td>
+                        <td>
+                          {L.aspect(a.aspect)} <span className="sub">{L.orb(a.orb)}</span>
+                        </td>
+                        <td>{a.meaning}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              <p className="hint" style={{ marginBottom: 12 }}>
+                {T.wholeSign(result.utcLabel)}
+              </p>
+            </details>
+
+            <div className="box" id="elements">
+              <h3>{T.elements}</h3>
+              {ELEM_ORDER.map((e) => {
+                const v = chart.elements[e];
+                const w = Math.round((v / 14) * 100);
+                const strong = e === result.elements.strongest;
+                return (
+                  <div key={e} className="elem-row">
+                    <span>{L.element(e)}</span>
+                    <div className="elem-bar" role="img" aria-label={T.elemAria(L.element(e), v, strong)}>
+                      <i style={{ width: `${w}%`, background: ELEM_SHADE[e] }} />
+                      {strong && <span className="dot" style={{ left: `${w}%` }} />}
+                    </div>
+                    <span className="elem-n">{v}</span>
+                  </div>
+                );
+              })}
+              <p className="hint" style={{ color: "var(--navy-70)" }}>
+                {T.elemPoints}
+              </p>
+              {result.elements.texts.map((t) => (
+                <p key={t}>{kp(t)}</p>
+              ))}
+            </div>
+
+            <div className="box" id="planet-reading">
+              <h3 className="sub-h" style={{ marginTop: 0 }}>
+                {result.planetReading.head || T.planetsHead}
+              </h3>
+              {result.planetReading.planets.map((p) => (
+                <div key={p.key} className="pcard">
+                  <p className="pc-h">
+                    <span className="pc-g sym" aria-hidden="true">
+                      {PLANET_GLYPHS[p.key]}
+                    </span>
+                    {p.title}
+                  </p>
+                  {p.shortLine && (
+                    <p>
+                      <b>{p.shortLine}</b> {p.text}
+                    </p>
+                  )}
+                  {p.houseLine && <p className="pc-house">{p.houseLine}</p>}
+                </div>
+              ))}
+              {result.planetReading.aspects.length > 0 && (
+                <>
+                  <h3 className="sub-h">{result.planetReading.aspectsHead || T.aspectsHead}</h3>
+                  {result.planetReading.aspects.map((a) => (
+                    <div key={a.title + a.sub} className="pcard">
+                      <p className="pc-h">
+                        {a.title} <small className="muted">{a.sub}</small>
+                      </p>
+                      <p>
+                        <b>{a.lineMeaning}</b> {a.text}
+                      </p>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </Section>
+
+          </>
+        )}
+
+        {/* ===== 2. 별이 본 나의 유형 ===== */}
+        {page === 2 && (
+          <>
+          <Section no={2} title={T.sec2} art={<PageArt page={2} signIndex={result.sunSignIndex} />}>
+            <div className="box">
+              <Summary text={character.summary} />
+              {/* 결제한 결과는 유형이 리포트와 묶여 바꿀 수 없으므로 고르기 자체를 보이지 않는다 */}
+              {result.tie && !paidSection && !paidPending && (
+                <>
+                  <h3>{T.tieHead}</h3>
+                  <p className="muted" style={{ fontSize: ".9rem" }}>
+                    {result.tie.intro}
+                  </p>
+                  {/* 예전 규칙으로 고른 유형이라 아래 네 가지에 없을 때 — 지금 어떤 유형이 적용됐는지 알려 준다 */}
+                  {!result.tie.options.some((o) => o.selected) && (
+                    <p className="muted" style={{ fontSize: ".9rem" }}>
+                      {T.legacyPick(L.competency(character.competency), L.style(character.style))}
+                    </p>
+                  )}
+                  <div className="choice">
+                    {result.tie.options.map((o, i) => (
+                      <button key={`${o.competency}-${o.style}`} type="button" id={`choice-${i}`} aria-pressed={o.selected} disabled={switching} onClick={() => !o.selected && void chooseType(o.competency, o.style)}>
+                        <b>
+                          {L.competency(o.competency)} × {L.style(o.style)}
+                        </b>
+                        {o.card}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+              <p style={{ marginTop: 14 }}>{kp(character.why)}</p>
+              {character.sunMoonLine && <p>{kp(character.sunMoonLine)}</p>}
+              {/* A6 역량·방식 쉬운 정의(owner 2026-10-10: 프로토타입에 없지만 유지) */}
+              {/* owner 2026-10-10: 역량·방식 두 줄 대신 '웰니스 유형으로 분류하면…' 한 문단 */}
+              {character.wellnessLine && <p>{character.wellnessLine}</p>}
+              {/* 영문판: 한 문단으로 이어 붙이지 않고 역량·방식 정의 두 줄(A6 영문 그대로) */}
+              {en && character.competencyLine && <p>{kp(character.competencyLine)}</p>}
+              {en && character.styleLine && <p>{kp(character.styleLine)}</p>}
+              <table className="tbl">
+                <caption className="sr-only">{T.big3Caption}</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">{T.thCard}</th>
+                    <th scope="col">{T.thLine}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.big3.map((b, i) => {
+                    const p = P[b.key]!;
+                    const sub = b.key === "asc" ? `${b.sign} ${p.deg.toFixed(1)}°` : `${b.sign}${withTime ? ` · ${L.house(p.house!)}` : ""}`;
+                    return (
+                      <tr key={b.key}>
+                        <td>
+                          {b.label}
+                          <span className="sub">{sub}</span>
+                        </td>
+                        <td>
+                          {/* 처음인 사람용 용어 설명(A16)은 owner 2026-10-11 요청으로 오른쪽 해석 앞에, 같은 글자 크기로 */}
+                          {firstTime && result.terms[i] && <span style={{ display: "block", marginBottom: 8 }}>{result.terms[i].line}</span>}
+                          {b.line}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Section>
+
+          </>
+        )}
+
+        {/* ===== 3. 2026 회고 ===== */}
+        {page === 3 && (
+          <>
+          <Section no={3} title={T.sec3(nickname)} art={<PageArt page={3} signIndex={result.sunSignIndex} />}>
+            <div className="box">
+              <Summary text={year2026.summary} />
+              {year2026.intro && <p>{kp(year2026.intro)}</p>}
+              <p className="bul">{T.turning}</p>
+              {year2026.turningPoints.map((t) => (
+                <p key={t}>{kp(t)}</p>
+              ))}
+              {/* 해석 DB v1.3 RULE_ORDER: 전환점 뒤에 단어 × 고민 영역(A12d) */}
+              {year2026.areaLine && <p>{kp(year2026.areaLine)}</p>}
+              <p className="bul">{year2026.quarterHead || T.quarterHead}</p>
+              {year2026.closing && <p>{kp(year2026.closing)}</p>}
+              <table className="tbl" id="tbl-2026">
+                <caption className="sr-only">{T.q2026Caption}</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">{T.thPeriod}</th>
+                    <th scope="col">{T.forYou(nickname)}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {year2026.quarters.map((q) => (
+                    <tr key={q.label}>
+                      <td>{q.label}</td>
+                      <td>{q.cell}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <WhyList head={T.skyHappened} groups={year2026.quarters.map((q) => ({ label: q.label, items: q.reasons }))} />
+            </div>
+          </Section>
+
+          {/* 웰니스 상담 안내(owner 2026-10-10: 모든 사람에게 3장에서). 2026 한 단어가 '그만하자·이별·고생'이면
+              그 톤에 맞춘 해석 DB 문장(A12 care_note + A15 FIX_CARE_CARD), 아니면 기본 안내(Claude 초안 — owner 검토 가능). 진행은 막지 않는다. */}
+          {en ? (
+            // 영문판: 쏘웰라 AI 영문 채팅·영문 상담 신청 화면이 아직 없어 버튼 없이 안내 문장만(부드러운 톤일 때 DB 영문 문장)
+            result.care && (
+              <div className="care">
+                {result.care.note && <p>{result.care.note}</p>}
+                <p>{result.care.card}</p>
+              </div>
+            )
+          ) : (
+          <div className="care">
+            {result.care ? (
+              <>
+                {result.care.note && <p>{result.care.note}</p>}
+                <p>{result.care.card}</p>
+              </>
+            ) : (
+              <p>{WELLNESS_SESSION_NOTE.replace("{닉네임}", nickname)}</p>
+            )}
+            <div className="flex flex-wrap gap-2">
+              {/* owner 2026-10-11: 기본 안내에서는 [쏘웰라와 이야기 나누기]만. 부드러운 톤(그만·이별·고생)은 안전 원칙(전문 상담 연결 안내)대로 상담 버튼을 남긴다 */}
+              {result.care && (
+                <a className="btn ghost small-btn" href={SESSION_URL}>
+                  웰니스 상담 알아보기
+                </a>
+              )}
+              <SowellaButton label="쏘웰라와 이야기 나누기" className="btn ghost small-btn" resultId={resultId} page={3} keepLabel />
+            </div>
+          </div>
+          )}
+
+            {/* owner 2026-10-26 (가): 로그인하지 않은 사람에게만, 막지 않는 로그인 권유 한 줄(문구 owner 확정) */}
+            {!loggedIn && resultId && !en && (
+              <p className="hint text-center">
+                로그인하면 결과가 보관되고 쏘웰라와 이어서 이야기할 수 있어요.{" "}
+                <a className="underline" href={`/login?next=${encodeURIComponent(`/results/${resultId}/3`)}`} onClick={() => track("save_click", { from: "page3" }, undefined)}>
+                  로그인하기
+                </a>
+              </p>
+            )}
+            {/* 무료 구간 끝: [SNS 공유하기] + [저장하기] */}
+            {en ? <ActionRowEn resultId={resultId ?? null} page={3} saveDone={result.saveCopy.saveDone} /> : <ActionRow share={share} copy={result.saveCopy} resultId={resultId ?? null} prefill={savePrefill} onRetrySave={onRetrySave} />}
+          </>
+        )}
+
+        {/* ===== 4~7. 결제 후 전체, 결제 전에는 굵은 요약 + 첫 두 문장만, 아래는 흐린 가짜 문장(B13) ===== */}
+        {page >= 4 && (
+          <>
+            {tempNote && <p className="hint text-center">{tempNote}</p>}
+            {/* 결제 후: 그 장의 섹션(쓰는 중이면 아직 없는 섹션은 null → 아래 잠긴 자리 + 안내) */}
+            {(paidSection && paidSection(page)) || (
+              <div className="locked-zone" id="locked-zone">
+                <section className="rsec paid locked" id={`sec-${page}`} aria-labelledby={`sec-${page}-t`}>
+                  <h2 className="rsec-title" id={`sec-${page}-t`} tabIndex={-1}>
+                    <span>{titles[page - 1]}</span>
+                  </h2>
+                  <PageArt page={page} signIndex={result.sunSignIndex} locked />
+                  <div className="box">
+                    {preview[page]?.first && <p className="lead summary">{preview[page].first}</p>}
+                    {!!preview[page]?.lines.length && (
+                      <div className="teaser">
+                        <p>{preview[page].lines.join(" ")}</p>
+                      </div>
+                    )}
+                    {/* 흐려지는 자리: 실제 본문이 아니라 해석 DB B13 가짜 문장(결제 전에는 실제 유료 본문을 보내지 않는다) */}
+                    <div className={`blur-wrap${paidPending ? " pending" : ""}`}>
+                      <div className="blur-dummy" aria-hidden="true" inert>
+                        {(preview[page]?.dummy.length ? preview[page].dummy : ["　".repeat(40), "　".repeat(40), "　".repeat(40), "　".repeat(40)]).map((t, i) => (
+                          <p key={i}>{t}</p>
+                        ))}
+                      </div>
+                      {paidPending && <ReportWriting nickname={nickname} slowText={paidPending.slowText} lang={lang} />}
+                    </div>
+                  </div>
+                </section>
+                {!resultId && <p className="hint text-center">{T.saveToPay}</p>}
+              </div>
+            )}
+            {/* 임시 계정으로 결제한 사람에게만(ResultView가 guest·로그인 안 함·결제함일 때만 넘김): 리포트 아래에 보관(가입) 안내 — owner 2026-10-17 */}
+            {tempBanner?.(page)}
+            {disclaimer}
+            {/* 4~7번 페이지마다 [SNS 공유하기][저장하기] — 결제 전이면 B11 SHARE_NOTE_LOCKED */}
+            <div className="page-share">
+              {!paidSection && !paidPending && <p className="share-note">{result.shareNoteLocked || T.shareNote}</p>}
+              {en ? <ActionRowEn resultId={resultId ?? null} page={page} saveDone={result.saveCopy.saveDone} /> : <ActionRow share={share} copy={result.saveCopy} resultId={resultId ?? null} prefill={savePrefill} onRetrySave={onRetrySave} />}
+            </div>
+          </>
+        )}
+
+        {page <= 3 && disclaimer}
+        <div className="pg-nav">
+          {page > 1 && (
+            <button type="button" className="btn ghost prev" onClick={() => go(page - 1)}>
+              {T.prev}
+            </button>
+          )}
+          {next ? (
+            <button type="button" className="btn next" onClick={() => go(next)}>
+              {T.nextStory}
+            </button>
+          ) : (
+            <button type="button" className="btn ghost next" onClick={() => go(1)}>
+              {T.first}
+            </button>
+          )}
+        </div>
+        {!next && <p className="pg-end-note">{T.endNote}</p>}
+        {!next && paidSection && (
+          <p className="mt-4 text-center">
+            <Link href={"/results"} className="linkish">
+              {T.myResults}
+            </Link>
+          </p>
+        )}
+
+      </div>
+
+      {/* 결제 카드(owner 2026-10-10: 4~7장 블러 위에 늘 따라다니게) — 결과가 아직 저장되지 않았어도 보이고, 그땐 버튼 대신 안내 */}
+      {/* 결제 카드: body에 바로 붙인다(portal) — 화면 상자(.screen)의 애니메이션이 position:fixed를 페이지 아래로 밀어내서
+          카드가 화면에 안 보이던 문제(owner 2026-10-10 '스크롤하면서 따라다니게') */}
+      {mounted && !paidSection && !paidPending && page >= 4 &&
+        createPortal(
+        // 결제 카드 하나(패키지 v3): 4~7장을 볼 때만. 가짜 카운트다운·'지금만 할인' 없음. 결제 후 이 페이지로 돌아온다(마지막 페이지 기억).
+        <div className="paybar pay-float" role="region" aria-label={T.payAria}>
+          <div className="pf-in">
+            <div className="pf-txt">
+              <p className="pp-t">{popup.message}</p>
+              {/* 영문 번역 묶음의 PAY_POPUP에 아직 '3-day Sowella AI pass'가 남아 있다(한국어 DB는 v1.2.4에서 삭제) — 이용권은 따로 주지 않으므로 그 부분만 숨긴다. 번역 묶음을 고치면 이 처리는 할 일이 없어진다 */}
+              {popup.sub && <p className="pp-s">{en ? popup.sub.replace(/\s*·?\s*Includes a 3-day Sowella AI pass\.?/i, "") : popup.sub}</p>}
+            </div>
+            {resultId ? (
+              <Link href={`/checkout/${resultId}?page=${page}`} className="btn block">
+                {popup.button || T.payButton}
+              </Link>
+            ) : (
+              <>
+                {/* 결과가 아직 저장되지 않음: 누르면 먼저 저장을 다시 해 본다(저장돼야 결제할 수 있음) */}
+                <button
+                  type="button"
+                  className="btn block"
+                  disabled={!onRetrySave}
+                  onClick={async () => {
+                    if (onRetrySave && !(await onRetrySave())) setToast(T.saveFail);
+                  }}
+                >
+                  {popup.button || T.payButton}
+                </button>
+                <p className="pp-temp">{T.saveFirst}</p>
+              </>
+            )}
+          </div>
+        </div>,
+          document.body,
+        )}
+      <BottomSheet open={!!sheet} onClose={() => setSheetKey(null)} labelledBy="sheet-title">
+        {sheet && <SheetBody sheet={sheet} />}
+      </BottomSheet>
+      <Toast msg={toast} />
+    </div>
+  );
+}

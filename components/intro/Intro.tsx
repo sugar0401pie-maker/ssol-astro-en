@@ -1,0 +1,114 @@
+"use client";
+
+// 1. 인트로(마스터스펙 6-1 화면 1, 2026-10-09 프로토타입 #scr-intro 마크업·클래스 그대로):
+// 그림 6장이 화면 전체를 채우고 2초마다 무작위로 바뀐다(같은 그림 연속 금지, '동작 줄이기'면 정지)
+// + "SSOL WELLNESS HOUSE" + 제목 + [테스트 하기](로그인 전이면 로그인 화면을 거침, 2026-11-05 다시 로그인 먼저)·[내 결과 보기](로그인 전이면 로그인 화면을 거침). 하단 정보는 그림 아래(.intro-foot)에 따로.
+// 참여자 수는 실제 숫자만 표시한다(가짜 사회적 증거 금지). owner가 알려 준 실제 누적 이용자 수(2026-11-02 기준) — 자동으로 늘지 않으니 숫자가 바뀌면 PARTICIPANTS를 고친다.
+import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import { track } from "@/lib/analytics/track";
+import SiteFooter from "@/components/SiteFooter";
+import AuthFooterLink from "@/components/auth/AuthFooterLink";
+import { getRealSession } from "@/lib/supabase/browser";
+import { INTRO_IMAGES, nextImage } from "./images";
+import { PARTICIPANTS as PARTICIPANTS_DATA } from "@/lib/about/participants";
+
+// 원본 jpg 그대로(화질 유지 — owner 결정: 그림은 줄이거나 다시 압축하지 않는다)
+/** 누적 이용자 수 — lib/about/participants.ts 한 곳에서(홈·/about이 늘 같은 값) */
+export const PARTICIPANTS = PARTICIPANTS_DATA.count;
+
+const src = (i: number) => `/intro/${INTRO_IMAGES[i]}.jpg`;
+
+export default function Intro() {
+  const [loggedIn, setLoggedIn] = useState(false);
+  const layers = useIntroSlideshow();
+
+  useEffect(() => {
+    void getRealSession().then((s) => setLoggedIn(!!s));
+    track("intro_view", {}, "intro_view");
+  }, []);
+
+  return (
+    <>
+      <section className="screen on" id="scr-intro" aria-labelledby="intro-title">
+        <div className="intro-bg" aria-hidden="true">
+          {/* eslint-disable-next-line @next/next/no-img-element -- 2초마다 바뀌는 배경이라 미리 불러 둔 원본을 쓴다 */}
+          <img src={src(layers.a)} alt="" fetchPriority="high" className={layers.showA ? "show" : ""} />
+          {layers.b !== null && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={src(layers.b)} alt="" className={layers.showA ? "" : "show"} />
+          )}
+        </div>
+        <p className="sr-only">밤하늘 아래 별자리 친구들이 모여 있는 일러스트</p>
+        <div className="intro-overlay">
+          <div className="logo-row">
+            {/* 쏠 웰니스 하우스 물결 로고(owner 2026-10-10 전달 이미지를 배경 없이 벡터로 옮김, public/logo-wave.svg와 같은 모양) */}
+            <svg width="38" height="10" viewBox="188 510 878 234" aria-hidden="true">
+              <path fill="#FDF6E9" d="M188 673C290 668 362 600 367 510H451C460 610 530 668 615 668C700 668 775 610 784 510H868C873 600 964 668 1066 673V744C960 744 870 705 826 641C780 705 700 744 615 744C530 744 450 705 407 641C365 705 290 744 188 744Z" />
+            </svg>
+            SSOL WELLNESS HOUSE
+          </div>
+          <h1 id="intro-title">쏠 아스트로 하우스</h1>
+          <p className="count">✨ 벌써 {PARTICIPANTS.toLocaleString("ko-KR")}명이 참여했어요</p>
+          <div className="intro-btns">
+            {/* owner 2026-11-05: 10-26 전처럼 로그인 먼저 — 로그인 전이면 [테스트 하기]·[내 결과 보기] 둘 다 로그인 화면을 거친다
+                (로그인 화면 아래 '로그인 없이 테스트하기'는 그대로 남음). */}
+            <Link href={loggedIn ? "/test" : "/login?next=/test"} className="btn block">
+              테스트 하기
+            </Link>
+            <Link href={loggedIn ? "/results" : "/login?next=/results"} className="btn block ghost">
+              내 결과 보기
+            </Link>
+          </div>
+        </div>
+      </section>
+      <div className="intro-foot">
+        <AuthFooterLink />
+        <SiteFooter />
+      </div>
+    </>
+  );
+}
+
+/** 첫 화면 배경 그림 바꾸기(한국어·영문 첫 화면 공통 — 그림은 같고 글만 다르다) */
+export function useIntroSlideshow() {
+  // 두 장을 겹쳐 두고 번갈아 보이게 한다(.intro-bg img.show, 0.7초). 첫 그림은 관측소(서버·브라우저가 같게), 2초 뒤부터 무작위.
+  const [layers, setLayers] = useState<{ a: number; b: number | null; showA: boolean }>({ a: 4, b: null, showA: true });
+  const current = useRef(layers.a);
+
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    // 첫 화면 속도(2026-10-18): 여섯 장을 한꺼번에 받지 않는다. 다음에 보일 한 장만 미리 받아 두고,
+    // 다 받아진 그림으로만 넘긴다(느린 망에서는 받아질 때까지 지금 그림이 그대로 있다).
+    let upcoming = nextImage(current.current);
+    let ready = false;
+    const preload = (i: number) => {
+      ready = false;
+      const im = new window.Image();
+      im.onload = () => {
+        if (i === upcoming) ready = true;
+      };
+      // 받기에 실패하면 다른 그림으로 다시 시도한다(실패한 그림에 멈춰 배경이 안 바뀌지 않게)
+      im.onerror = () => {
+        if (i !== upcoming) return;
+        upcoming = nextImage(current.current);
+        window.setTimeout(() => preload(upcoming), 3000);
+      };
+      im.src = src(i);
+    };
+    preload(upcoming);
+    const timer = setInterval(() => {
+      if (!ready) return;
+      const n = upcoming;
+      current.current = n;
+      setLayers((l) => (l.showA ? { ...l, b: n, showA: false } : { ...l, a: n, showA: true }));
+      upcoming = nextImage(n);
+      preload(upcoming);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return layers;
+}
+
+export const introSrc = src;

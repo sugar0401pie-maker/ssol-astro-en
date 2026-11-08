@@ -1,0 +1,34 @@
+{
+  "name": "ssol-astro-en",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3200",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "node --test --no-warnings lib/billing/*.test.ts lib/astro/*.test.ts lib/report/*.test.ts lib/auth/*.test.ts lib/results/guest.test.ts lib/results/consent.test.ts lib/results/lastPage.test.ts lib/results/pageArt.test.ts lib/results/saveLimit.test.ts lib/guide/art.test.ts lib/analytics/*.test.ts lib/attribution/*.test.ts lib/x/*.test.ts lib/seo.test.ts lib/i18n/*.test.ts lib/legal/en/*.test.ts lib/en/*.test.ts lib/ui/*.test.ts lib/share/*.test.ts components/test/*.test.ts components/intro/*.test.ts"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.116.0",
+    "@tosspayments/payment-widget-sdk": "^0.12.2",
+    "@tosspayments/tosspayments-sdk": "^2.10.0",
+    "astronomy-engine": "2.1.19",
+    "next": "16.3.5",
+    "openai": "^7.30.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.5",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

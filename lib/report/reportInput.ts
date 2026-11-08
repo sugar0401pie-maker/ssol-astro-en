@@ -1,0 +1,213 @@
+// 유료 리포트 AI 입력 조립(마스터스펙 7-2). 숫자·날짜는 모두 토큰으로 바꿔 넣고, 실제 값은 tokenValues에만 둔다.
+// AI는 계산하지 않는다 — 판정·연도·근거는 여기서 정해져 넘어가고 AI는 바꾸지 않는다(5-3).
+// DB 문장(db_sentences)은 owner가 준비 중인 DB가 오면 채운다(지금은 빈 배열).
+import { SIGNS } from "../astro/constants.ts";
+import { isSoftTone, type Answers, q2Label } from "../astro/answers.ts";
+import type { CharacterResult } from "../astro/character.ts";
+import type { Accuracy, NatalChart } from "../astro/natal.ts";
+import type { PeriodKey, PeriodResult, ScoredEvent } from "../astro/timeline.ts";
+import { EDGE_LABEL, WISH_LEVEL_DISPLAY, type WishResult } from "../astro/wish.ts";
+import { formatMonths, formatRanges, formatYear, josa } from "./format.ts";
+import { POINT_KO, eventLabel, eventNames, eventLabelEn, eventNamesEn, pointEn, signEn, aspectEn, EN_PLANET_NAMES, EN_SIGN_NAMES } from "./labels.ts";
+import { PEN } from "./paidLang.ts";
+import { MODALITY_EN, COMPETENCY_EN, STYLE_EN, ELEMENT_EN } from "./lang.ts";
+import { EN_Q1, EN_Q2, EN_Q3 } from "../en/questions.ts";
+
+export interface TokenInfo {
+  value: string;
+  meaning: string;
+}
+
+export interface ReportEventInput {
+  token: string;
+  event: string;
+  score: number;
+  domain_relevant: boolean;
+}
+
+export interface ReportInput {
+  user: { nickname: string; accuracy: Accuracy };
+  chart: { sun: string; moon: string; asc: string | null; element: string };
+  /** 캐릭터(동물) 이름은 넣지 않는다 — 당분간 화면 비노출(show_character=false). name 자리에 유형 한 줄(A5 type_line). */
+  character: { name: string; competency: string; style: string };
+  answers: { q1_domain: string; q2_word_2026: string; q3_wish_2027: string };
+  events_eoy: ReportEventInput[];
+  events_2027: ReportEventInput[];
+  events_5y: ReportEventInput[];
+  domain_quiet: Partial<Record<PeriodKey, boolean>>;
+  /** 연도 토큰 → "활짝 열리는 해(순풍)"처럼 두 말 함께 */
+  wish_support: Record<string, string>;
+  /** 연도 토큰 → 경계 표시(B10, 예: 활짝 열리는 해에 가까움). 없으면 빠짐 */
+  wish_edge: Record<string, string>;
+  /** 연도 토큰 → 움직이는 해 / 잔잔한 해 / ''(좋고 나쁨 없음) */
+  movement: Record<string, string>;
+  /** 활동 / 고정 / 변통 (B9 문장 버전) */
+  temperament: string;
+  /** 2027 '흐름 한눈에' 단계 토큰(서버가 단계로 묶음) */
+  flow_2027: string[];
+  /** 연도 토큰 → 근거 목록(라벨 + 기간 토큰) */
+  wish_reason: Record<string, Array<{ token: string; reason: string }>>;
+  first_open_year: string | null;
+  closest_year: string | null;
+  headwind_years: string[];
+  houses_excluded: boolean;
+  soft_tone: boolean;
+  db_sentences: string[];
+}
+
+export interface BuiltReportInput {
+  input: ReportInput;
+  /** 토큰 이름 → 실제 값·뜻(프롬프트의 {tokens}와 출력 치환에 함께 쓴다) */
+  tokens: Record<string, TokenInfo>;
+  /** 검증용: AI가 언급해도 되는 행성·별자리 이름 */
+  allowedNames: string[];
+  /** 검증용: 문장에 써도 되는 하우스 번호 */
+  allowedHouses: number[];
+  headwind2027: boolean;
+}
+
+
+export function buildReportInput(args: {
+  nickname: string;
+  chart: NatalChart;
+  character: CharacterResult;
+  answers: Answers;
+  periods: Record<PeriodKey, PeriodResult>;
+  wish: WishResult;
+  /** A5 type_line — 캐릭터 이름 대신 쓰는 유형 한 줄 */
+  typeLine: string;
+  /** 2027 흐름 단계 이름(뼈대 flowStages와 같은 값, 예: "1~4월 — 정하지 말고 준비") */
+  flow?: string[];
+  /** 바람과 흐름 잇기 {{흐름근거}}(2027)·{{바라던해}}(5년) 값 — 뼈대에서 */
+  bridgeBasis27?: string;
+  desiredYear?: number | null;
+  /** 영문판(2026-11-04): 토큰 값(날짜·연도)·이름·라벨을 영어로. 한국어는 그대로 */
+  lang?: "ko" | "en";
+}): BuiltReportInput {
+  const { nickname, chart, character, answers, periods, wish } = args;
+  const en = args.lang === "en";
+  const ranges = (ivs: Array<{ from: string; to: string }>, withYear: boolean) =>
+    en ? ivs.map((iv) => (withYear && iv.from.slice(0, 4) === iv.to.slice(0, 4) ? `${PEN.range(iv.from, iv.to)}, ${iv.from.slice(0, 4)}` : PEN.range(iv.from, iv.to))).join("; ") : formatRanges(ivs, withYear);
+  const months = (ivs: Array<{ from: string; to: string }>) => (en ? [...new Set(ivs.map((iv) => PEN.month(Number(iv.from.slice(5, 7)))))].join(" & ") : formatMonths(ivs));
+  const yearStr = (y: number) => (en ? String(y) : formatYear(y));
+  const label = (e: Parameters<typeof eventLabel>[0]) => (en ? eventLabelEn(e) : eventLabel(e));
+  const evNames = (e: Parameters<typeof eventNames>[0]) => (en ? eventNamesEn(e) : eventNames(e));
+  const pName = (k: string) => (en ? pointEn(k) : POINT_KO[k as keyof typeof POINT_KO]);
+  const tokens: Record<string, TokenInfo> = {};
+  const names = new Set<string>();
+  const houses = new Set<number>();
+  const addHouses = (...hs: Array<number | null | undefined>) => hs.forEach((x) => typeof x === "number" && houses.add(x));
+  for (const p of Object.values(chart.planets)) addHouses(p?.house);
+  for (const k of ["sun", "moon", "asc"] as const) {
+    const p = chart.planets[k];
+    if (p) names.add(en ? signEn(p.sign) : p.sign);
+  }
+  names.add(en ? "Sun" : "태양").add(en ? "Moon" : "달");
+  if (chart.planets.asc) names.add(en ? "Ascendant" : "상승궁");
+
+  const events = (key: PeriodKey, prefix: string, withYear: boolean): ReportEventInput[] =>
+    periods[key].top.map((s: ScoredEvent, i) => {
+      const token = `${prefix}${i + 1}_기간`;
+      tokens[token] = { value: ranges(s.intervalsInWindow, withYear), meaning: en ? `period of ${label(s.event)}` : `${eventLabel(s.event)}의 기간` };
+      evNames(s.event).forEach((n) => names.add(n));
+      const e = s.event;
+      if (e.kind === "transit") addHouses(e.targetHouse, e.transitHouse);
+      else if (e.kind !== "chiron_return") addHouses(e.house);
+      return { token, event: label(s.event), score: s.score, domain_relevant: s.domainRelevant };
+    });
+
+  const wish_support: Record<string, string> = {};
+  const wish_reason: ReportInput["wish_reason"] = {};
+  const wish_edge: Record<string, string> = {};
+  const movement: Record<string, string> = {};
+  const headwind_years: string[] = [];
+  let r = 0;
+  for (const y of wish.years) {
+    const yt = `Y${y.year}`;
+    tokens[yt] = { value: yearStr(y.year), meaning: en ? `the year ${y.year}` : `${y.year}년(연도)` };
+    wish_support[yt] = en ? PEN.level(y.level) : WISH_LEVEL_DISPLAY[y.level];
+    if (y.edge) wish_edge[yt] = en ? PEN.edge(y.edge, EDGE_LABEL[y.edge]) : EDGE_LABEL[y.edge];
+    movement[yt] = en ? PEN.movement(y.movementLabel) : y.movementLabel;
+    if (y.level === "역풍") headwind_years.push(yt);
+    if (y.reasons.length) {
+      wish_reason[yt] = y.reasons.map((f) => {
+        const token = `R${++r}_시기`;
+        tokens[token] = { value: months(f.intervals), meaning: en ? "the months behind this" : "근거가 되는 달" };
+        const reason = en
+          ? f.kind === "house"
+            ? `${pName(f.transit)} passes through the ${f.house}H`
+            : `${pName(f.transit)} ${aspectEn(f.aspect)} natal ${f.target.startsWith("H") ? f.target : pName(f.target)}`
+          : f.kind === "house"
+            ? `${josa(POINT_KO[f.transit], "이/가")} ${f.house}하우스를 지남`
+            : `${POINT_KO[f.transit]} ${f.aspect} 출생 ${f.target.startsWith("H") ? f.target : POINT_KO[f.target as keyof typeof POINT_KO]}`;
+        names.add(pName(f.transit));
+        if (f.kind === "house") addHouses(f.house);
+        if (f.kind === "aspect" && !f.target.startsWith("H")) names.add(pName(f.target));
+        return { token, reason };
+      });
+    }
+  }
+  const yearToken = (y: number | null, name: string) => {
+    if (y === null) return null;
+    tokens[name] = { value: yearStr(y), meaning: en ? (name === "열리는해" ? "the year the wish opens up" : "the year that comes closest to the wish") : name === "열리는해" ? "바라는 것이 열리는 해" : "바라는 것에 가장 가까워지는 해" };
+    return `{{${name}}}`;
+  };
+  // 바람과 흐름 잇기(06 v3.1): 서버가 고른 사건 구절·바라던 해
+  if (args.bridgeBasis27)
+    tokens["흐름근거"] = { value: args.bridgeBasis27, meaning: en ? "the biggest 2027 event supporting the wish, with its month (e.g. 'late July, when Jupiter moves into your career area')" : "2027년에 바람을 돕는 가장 큰 사건을 월과 함께 쓴 '-는' 구절(뒤에 '무렵' 등을 붙여 씀)" };
+  if (args.desiredYear) tokens["바라던해"] = { value: yearStr(args.desiredYear), meaning: en ? "the first Open Year in the five years, or else the year closest to the wish" : "5년 안의 첫 활짝 열리는 해, 없으면 바람에 가장 가까워지는 해" };
+  if (headwind_years.length) tokens["역풍해"] = { value: tokens[headwind_years[0]].value, meaning: en ? "the first Building Year" : "첫 역풍 해" };
+  const qLabel = <T extends string>(list: ReadonlyArray<readonly [T, string]>, v: T) => list.find(([k]) => k === v)?.[1] ?? v;
+  const placedL = (k: "sun" | "moon" | "asc") => {
+    const p = chart.planets[k];
+    if (!p) return null;
+    const sg = en ? signEn(p.sign) : p.sign;
+    return p.house ? `${sg}/${p.house}H` : sg;
+  };
+
+  const input: ReportInput = {
+    user: { nickname, accuracy: chart.accuracy },
+    chart: {
+      sun: placedL("sun")!,
+      moon: placedL("moon")!,
+      asc: placedL("asc"),
+      element: ((e: string) => (en ? ELEMENT_EN[e] ?? e : e))((Object.entries(chart.elements).sort((a, b) => b[1] - a[1])[0] ?? ["", 0])[0]),
+    },
+    character: { name: args.typeLine, competency: en ? COMPETENCY_EN[character.competency] ?? character.competency : character.competency, style: en ? STYLE_EN[character.style] ?? character.style : character.style },
+    answers: en
+      ? { q1_domain: qLabel(EN_Q1, answers.q1), q2_word_2026: qLabel(EN_Q2, answers.q2), q3_wish_2027: qLabel(EN_Q3, answers.q3) }
+      : { q1_domain: answers.q1, q2_word_2026: q2Label(answers.q2), q3_wish_2027: answers.q3 },
+    events_eoy: events("eoy", "E", false),
+    events_2027: events("year2027", "T", false),
+    events_5y: events("fiveYears", "F", true),
+    domain_quiet: { eoy: periods.eoy.domainQuiet, year2027: periods.year2027.domainQuiet, fiveYears: periods.fiveYears.domainQuiet },
+    wish_support,
+    wish_edge,
+    movement,
+    temperament: en ? MODALITY_EN[wish.temperament] ?? wish.temperament : wish.temperament,
+    flow_2027: (args.flow ?? []).map((text, i) => {
+      const name = `흐름${i + 1}`;
+      tokens[name] = { value: text, meaning: en ? "one stage of the 2027 flow (period — stage name), used as-is to open a '• How 2027 unfolds' bullet paragraph" : "2027년 흐름의 한 단계(시기 — 단계 이름), '• 2027년 흐름' 불릿 문단 첫머리에 그대로" };
+      return `{{${name}}}`;
+    }),
+    wish_reason,
+    first_open_year: yearToken(wish.firstOpenYear, "열리는해"),
+    closest_year: yearToken(wish.closestYear, "가까워지는해"),
+    headwind_years,
+    houses_excluded: wish.housesExcluded,
+    soft_tone: isSoftTone(answers.q2),
+    db_sentences: [],
+  };
+
+  return {
+    input,
+    tokens,
+    allowedHouses: [...houses].sort((a, b) => a - b),
+    allowedNames: [...names].filter((n) => n.length > 0 && (en ? [...EN_SIGN_NAMES, ...EN_PLANET_NAMES] : (SIGNS as readonly string[]).concat(Object.values(POINT_KO))).includes(n)),
+    headwind2027: wish.years[0]?.level === "역풍",
+  };
+}
+
+export function tokenValues(tokens: Record<string, TokenInfo>): Record<string, string> {
+  return Object.fromEntries(Object.entries(tokens).map(([k, v]) => [k, v.value]));
+}

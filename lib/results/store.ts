@@ -1,0 +1,414 @@
+import "server-only";
+// astro_results 읽기·쓰기(서버 전용, service_role). 모든 조회는 주인(계정 user_id 또는 비회원 열쇠 해시)으로 한 번 더 거른다 —
+// RLS를 우회하는 키라서, 코드에서 소유자 확인을 빠뜨리면 남의 결과가 보일 수 있기 때문. 비회원 행은 user_id가 비어 있어야만 맞는다.
+import type { Answers } from "@/lib/astro/answers";
+import type { BirthInput, BirthResult } from "@/lib/astro/birth";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { ASTRO_DB } from "@/lib/report/dbData";
+import { CONSENT_VERSION } from "./consent";
+import { EN_CONSENT_VERSION } from "@/lib/en/birthForm";
+import { guestExpiry } from "./guest";
+import type { Owner } from "./owner";
+import type { Attribution, ShareChannel, Touch } from "@/lib/attribution/attribution";
+
+/** 주인 조건을 붙인다(supabase 쿼리 빌더 — 타입이 너무 깊어 최소 모양으로만 다룬다). */
+type Filterable = { eq(column: string, value: string): Filterable; is(column: string, value: null): Filterable };
+function byOwner<Q>(q: Q, owner: Owner): Q {
+  const f = q as unknown as Filterable;
+  return (owner.kind === "user" ? f.eq("user_id", owner.userId) : f.is("user_id", null).eq("guest_token_hash", owner.tokenHash)) as unknown as Q;
+}
+
+const TABLE = "astro_results";
+
+export interface StoredResult {
+  id: string;
+  created_at: string;
+  nickname: string;
+  first_time: boolean;
+  birth_input: BirthInput;
+  answers: Answers;
+  character: string;
+  sun_sign: string;
+  accuracy: string;
+  paid_at?: string | null;
+}
+
+export async function saveResult(args: {
+  owner: Owner;
+  nickname: string;
+  firstTime: boolean;
+  input: BirthInput;
+  answers: Answers;
+  birth: BirthResult & { resolved: NonNullable<BirthResult["resolved"]> };
+  /** 쏘웰라 채팅용 요약(lib/report/chatSummary.ts). 없으면 저장하지 않는다. */
+  chatSummary?: string | null;
+  /** 유입 경로(서버에서 sanitizeAttribution을 거친 값). 없으면 저장하지 않는다. */
+  attribution?: Attribution | null;
+}): Promise<string> {
+  const { owner, nickname, firstTime, input, answers, birth, chatSummary, attribution } = args;
+  const { chart, character } = birth.resolved;
+  const row = {
+      ...(owner.kind === "user"
+        ? { user_id: owner.userId }
+        : { user_id: null, guest_token_hash: owner.tokenHash, expires_at: guestExpiry(new Date(), false) }),
+      nickname,
+      first_time: firstTime,
+      birth_input: input,
+      birth_local: birth.stored.local,
+      time_zone: birth.stored.timeZone,
+      birth_utc: birth.stored.utc,
+      place_label: input.place.label,
+      answers,
+      accuracy: birth.accuracy,
+      character: character.name,
+      competency: character.competency,
+      style: character.style,
+      sun_sign: chart.planets.sun!.sign,
+      engine_version: birth.engineVersion,
+      db_version: ASTRO_DB.version,
+      consent_version: input.lang === "en" ? EN_CONSENT_VERSION : CONSENT_VERSION,
+      consented_at: new Date().toISOString(),
+  };
+  const insert = (r: object) => createAdminClient().from(TABLE).insert(r).select("id").single();
+  const summary = chatSummary ? { chat_summary: chatSummary, chat_summary_at: new Date().toISOString() } : {};
+  const source = attribution ? { attribution_first: attribution.first, attribution_last: attribution.last } : {};
+  let { data, error } = await insert({ ...row, ...summary, ...source });
+  // 유입 경로 마이그레이션(20261015000000) 전이면 attribution 칸이 없다(42703) — 유입 경로 없이 다시(결과 저장은 막지 않음).
+  if (error?.code === "42703" && attribution) ({ data, error } = await insert({ ...row, ...summary }));
+  // 비회원·요약 마이그레이션(20261008000200) 전이면 chat_summary 칸이 없다(42703) — 요약 없이 다시 저장(로그인 사용자는 계속 저장되게).
+  if (error?.code === "42703" && chatSummary) ({ data, error } = await insert(row));
+  if (error || !data) throw new Error(`결과 저장 실패: ${error?.code ?? "no data"}`);
+  return data.id as string;
+}
+
+/** 이 주인(계정 또는 비회원 열쇠)이 since 이후 저장한 결과 수 — 하루 저장 한도용(saveLimit.ts) */
+export async function countResultsSince(owner: Owner, since: Date): Promise<number> {
+  const { count, error } = await byOwner(createAdminClient().from(TABLE).select("id", { count: "exact", head: true }), owner).gte("created_at", since.toISOString());
+  if (error) throw new Error(`결과 수 확인 실패: ${error.code}`);
+  return count ?? 0;
+}
+
+export async function listResults(
+  owner: Owner,
+): Promise<Array<Pick<StoredResult, "id" | "created_at" | "nickname" | "character" | "sun_sign" | "accuracy"> & { consent_version?: string; last_page?: number | null; paid_at?: string | null }>> {
+  // consent_version: 같은 약관 버전에 이미 동의한 계정은 다음 테스트에서 동의를 체크된 상태로 보여 준다(패키지 v3)
+  // last_page: 마지막으로 보던 장(마이그레이션 20261010000000 전이면 칸이 없어 빼고 다시 읽는다 — 42703)
+  const base = "id, created_at, nickname, character, sun_sign, accuracy, consent_version";
+  const q = (cols: string) => byOwner(createAdminClient().from(TABLE).select(cols), owner).order("created_at", { ascending: false }).limit(50);
+  // paid_at: 목록에 '리포트 결제함' 표시(owner 2026-10-11 — 한 계정에 결과 여러 개, 가족·친구 생년월일 포함)
+  let { data, error } = await q(`${base}, last_page, paid_at`);
+  if (error?.code === "42703") ({ data, error } = await q(`${base}, paid_at`));
+  if (error?.code === "42703") ({ data, error } = await q(base));
+  if (error) throw new Error(`결과 목록 실패: ${error.code}`);
+  return (data ?? []) as unknown as Awaited<ReturnType<typeof listResults>>;
+}
+
+const RESULT_COLS = "id, created_at, nickname, first_time, birth_input, answers, character, sun_sign, accuracy";
+
+export async function getResult(owner: Owner, id: string): Promise<StoredResult | null> {
+  const q = (cols: string) => byOwner(createAdminClient().from(TABLE).select(cols), owner).eq("id", id).maybeSingle();
+  let { data, error } = await q(`${RESULT_COLS}, paid_at`);
+  // 결제 마이그레이션(20261008000100) 실행 전이면 paid_at 칸이 없다 — 그 칸 없이 다시 읽어 결과 보기는 계속 되게(42703 = 없는 칸).
+  if (error?.code === "42703") ({ data, error } = await q(RESULT_COLS));
+  if (error) throw new Error(`결과 조회 실패: ${error.code}`);
+  return (data as unknown as StoredResult | null) ?? null;
+}
+
+/** 결과 2번 섹션에서 동점 유형을 바꿨을 때: 저장된 입력(competencyPick)과 판정 요약만 고친다. 본인 것만. */
+export async function updateResultPick(
+  owner: Owner,
+  id: string,
+  patch: { input: BirthInput; character: string; competency: string; style: string; chatSummary?: string | null },
+): Promise<boolean> {
+  const row: Record<string, unknown> = { birth_input: patch.input, character: patch.character, competency: patch.competency, style: patch.style };
+  // 결제한 결과는 바꾸지 않는다 — 확인과 수정 사이에 결제가 끝나도 리포트와 어긋나지 않게 수정 자체에 조건을 둔다.
+  const run = (r: object) => byOwner(createAdminClient().from(TABLE).update(r), owner).eq("id", id).is("paid_at", null).select("id");
+  let { data, error } = await run(patch.chatSummary ? { ...row, chat_summary: patch.chatSummary, chat_summary_at: new Date().toISOString() } : row);
+  if (error?.code === "42703" && patch.chatSummary) ({ data, error } = await run(row));
+  if (error) throw new Error(`결과 수정 실패: ${error.code}`);
+  return (data?.length ?? 0) > 0;
+}
+
+export async function deleteResult(owner: Owner, id: string): Promise<boolean> {
+  const { data, error } = await byOwner(createAdminClient().from(TABLE).delete(), owner).eq("id", id).select("id");
+  if (error) throw new Error(`결과 삭제 실패: ${error.code}`);
+  return (data?.length ?? 0) > 0;
+}
+
+export const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+
+// ---- 결제·유료 리포트 ----
+
+export interface PayState {
+  paid: boolean;
+  reportStatus: "none" | "generating" | "ready" | "failed";
+  reportStartedAt: string | null;
+}
+
+export async function getPayState(owner: Owner, resultId: string): Promise<(PayState & { report: unknown }) | null> {
+  const { data, error } = await byOwner(createAdminClient().from(TABLE).select("paid_at, report_status, report_started_at, report"), owner)
+    .eq("id", resultId)
+    .maybeSingle();
+  if (error) throw new Error(`결제 상태 조회 실패: ${error.code}`);
+  if (!data) return null;
+  return { paid: !!data.paid_at, reportStatus: data.report_status, reportStartedAt: data.report_started_at, report: data.report };
+}
+
+/**
+ * currency USD(영문판, 2026-11-04)면 amount는 센트. USD 주문은 통화 칸 마이그레이션(20261104000000)이 없으면 만들지 않는다 —
+ * 칸 없이 저장되면 기본값 KRW가 붙어 299가 '299원'으로 읽히므로(fail closed).
+ */
+export async function createOrder(owner: Owner, resultId: string, amount: number, withdrawalVersion: string, attributionLast: Touch | null = null, currency: "KRW" | "USD" = "KRW", receiptEmail: string | null = null): Promise<string> {
+  const who = owner.kind === "user" ? { user_id: owner.userId } : { user_id: null, guest_token_hash: owner.tokenHash };
+  const row = { ...who, result_id: resultId, amount, status: "pending", ...(currency === "USD" ? { currency, receipt_email: receiptEmail } : {}) };
+  const insert = (r: object) => createAdminClient().from("astro_orders").insert(r).select("id").single();
+  const notice = { withdrawal_notice_at: new Date().toISOString(), withdrawal_notice_version: withdrawalVersion };
+  let { data, error } = await insert({ ...row, ...notice, ...(attributionLast ? { attribution_last: attributionLast } : {}) });
+  // 유입 경로 마이그레이션(20261015000000) 전이면 attribution_last 칸이 없다(42703) — 칸 없이 다시(결제는 막지 않음)
+  if (error?.code === "42703" && currency === "USD") throw new Error("주문 생성 실패: 통화 칸 마이그레이션 필요");
+  if (error?.code === "42703" && attributionLast) ({ data, error } = await insert({ ...row, ...notice }));
+  // 동의 기록 마이그레이션(20261011000000) 전이면 칸이 없다(42703) — 결제는 막지 않고 칸 없이 다시(동의는 astro_consents에도 남김 시도)
+  if (error?.code === "42703") ({ data, error } = await insert(row));
+  if (error || !data) throw new Error(`주문 생성 실패: ${error?.code ?? "no data"}`);
+  return data.id as string;
+}
+
+export async function getOrder(orderId: string) {
+  const base = "id, user_id, guest_token_hash, result_id, amount, status";
+  const q = (cols: string) => createAdminClient().from("astro_orders").select(cols).eq("id", orderId).maybeSingle();
+  let { data, error } = await q(`${base}, attribution_last, currency, receipt_email`);
+  // 통화 칸 마이그레이션(20261104000000) 전이면 currency가 없다 — 그때 주문은 모두 원화
+  if (error?.code === "42703") ({ data, error } = await q(`${base}, attribution_last`));
+  // 유입 경로 마이그레이션(20261015000000) 전이면 칸이 없다(42703) — 칸 없이 다시
+  if (error?.code === "42703") ({ data, error } = await q(base));
+  if (error) throw new Error(`주문 조회 실패: ${error.code}`);
+  return data as unknown as OrderRow | null;
+}
+
+export interface OrderRow {
+  id: string;
+  user_id: string | null;
+  guest_token_hash: string | null;
+  result_id: string | null;
+  amount: number;
+  status: string;
+  /** KRW(원) / USD(센트). 칸이 없던 예전 주문은 undefined = KRW */
+  currency?: "KRW" | "USD";
+  /** 영문판 비회원 결제의 주문 확인 이메일 주소 */
+  receipt_email?: string | null;
+  /** 주문을 만들 때의 유입 경로(이번 방문) — X 광고 클릭 식별자(twclid)도 여기에 */
+  attribution_last?: { twclid?: string } | null;
+}
+
+/** 이 주문의 주인인지(비회원 주문이 나중에 계정으로 옮겨졌으면 계정으로만 맞는다). */
+export function ownsOrder(owner: Owner, order: Pick<OrderRow, "user_id" | "guest_token_hash">): boolean {
+  return owner.kind === "user" ? order.user_id === owner.userId : order.user_id === null && order.guest_token_hash === owner.tokenHash;
+}
+
+/** pending일 때만 바꾼다(같은 주문을 두 번 승인 처리하지 않게). 바뀌었으면 true. */
+export async function settleOrder(orderId: string, status: "paid" | "canceled", extra: { paymentKey?: string; method?: string | null } = {}): Promise<boolean> {
+  const { data, error } = await createAdminClient()
+    .from("astro_orders")
+    .update({
+      status,
+      ...(status === "paid" ? { paid_at: new Date().toISOString(), payment_key: extra.paymentKey ?? null, method: extra.method ?? null } : {}),
+    })
+    .eq("id", orderId)
+    .eq("status", "pending")
+    .select("id");
+  if (error) throw new Error(`주문 갱신 실패: ${error.code}`);
+  return (data?.length ?? 0) > 0;
+}
+
+/**
+ * 토스에서 승인(DONE)을 확인한 주문을 결제 완료로. pending뿐 아니라, 예전 코드나 동시 요청이 잘못 'canceled'로
+ * 바꿔 둔 주문도 되돌린다(돈은 이미 나갔으므로). 같은 결과에 이미 결제된 다른 주문이 있으면(고유 색인 23505) "duplicate".
+ */
+export async function markOrderPaid(orderId: string, extra: { paymentKey: string; method: string | null }): Promise<"ok" | "duplicate"> {
+  const { error } = await createAdminClient()
+    .from("astro_orders")
+    .update({ status: "paid", paid_at: new Date().toISOString(), payment_key: extra.paymentKey, method: extra.method })
+    .eq("id", orderId)
+    .in("status", ["pending", "canceled"]);
+  if (error?.code === "23505") return "duplicate";
+  if (error) throw new Error(`주문 갱신 실패: ${error.code}`);
+  return "ok";
+}
+
+/** 결과가 이미 결제됐는지(같은 결과를 두 번 결제하지 않게, 토스 승인 전에 확인). */
+export async function isResultPaid(resultId: string): Promise<boolean> {
+  const { data, error } = await createAdminClient().from(TABLE).select("paid_at").eq("id", resultId).maybeSingle();
+  if (error) throw new Error(`결과 결제 확인 실패: ${error.code}`);
+  return !!data?.paid_at;
+}
+
+export async function markResultPaid(resultId: string): Promise<void> {
+  const db = createAdminClient();
+  const { error } = await db.from(TABLE).update({ paid_at: new Date().toISOString() }).eq("id", resultId).is("paid_at", null);
+  if (error) throw new Error(`결과 결제 표시 실패: ${error.code}`);
+  // 아직 계정이 없는 결제 결과는 결제일로부터 다시 30일(그 전에 가입하면 기한이 없어짐).
+  const { error: e2 } = await db.from(TABLE).update({ expires_at: guestExpiry(new Date(), true) }).eq("id", resultId).is("user_id", null);
+  if (e2) throw new Error(`보관 기한 갱신 실패: ${e2.code}`);
+}
+
+/**
+ * 비회원 결과·주문을 계정으로 옮긴다(가입·로그인 직후, 같은 브라우저의 열쇠로). 옮긴 결과 id들을 돌려준다.
+ * 열쇠는 그 자리에서 지워져 다시 쓸 수 없다.
+ */
+export async function claimGuestResults(userId: string, tokenHash: string): Promise<string[]> {
+  const db = createAdminClient();
+  const { data, error } = await db
+    .from(TABLE)
+    .update({ user_id: userId, guest_token_hash: null, expires_at: null, claimed_at: new Date().toISOString() })
+    .is("user_id", null)
+    .eq("guest_token_hash", tokenHash)
+    .select("id");
+  if (error) throw new Error(`결과 옮기기 실패: ${error.code}`);
+  const { error: e2 } = await db.from("astro_orders").update({ user_id: userId, guest_token_hash: null }).is("user_id", null).eq("guest_token_hash", tokenHash);
+  if (e2) throw new Error(`주문 옮기기 실패: ${e2.code}`);
+  // 로그인 전에 만든 공유 링크도 계정으로(표가 없으면 — 마이그레이션 전 — 건너뜀, 옮기기 자체는 막지 않음)
+  const { error: e3 } = await db.from("astro_share_links").update({ user_id: userId, guest_token_hash: null }).is("user_id", null).eq("guest_token_hash", tokenHash);
+  if (e3) console.warn("공유 링크 옮기기 실패:", e3.code);
+  return (data ?? []).map((r) => r.id as string);
+}
+
+/** 기한이 지난 비회원 결과를 지운다(결제 기록은 astro_orders에 남는다). 지운 수. */
+export async function deleteExpiredGuestResults(now = new Date()): Promise<number> {
+  const { data, error } = await createAdminClient().from(TABLE).delete().is("user_id", null).lt("expires_at", now.toISOString()).select("id");
+  if (error) throw new Error(`기한 지난 결과 삭제 실패: ${error.code}`);
+  return data?.length ?? 0;
+}
+
+/**
+ * 리포트 생성 자리를 잡는다: 아직 없거나 실패했거나, 생성 중인데 너무 오래(5분) 멈춰 있으면 'generating'으로 바꾸고 true.
+ * 이미 누가 만들고 있으면 false — 같은 리포트를 동시에 두 번 만들지 않게.
+ */
+/**
+ * 리포트 생성 자리 잡기. 성공하면 이번 시도의 표시(시작 시각 문자열)를 돌려준다 — 저장할 때 이 표시가 그대로일 때만 덮어써서,
+ * 늦게 끝난 옛 시도가 새 시도의 결과를 덮지 않게 한다. 자리를 못 잡으면 null.
+ * staleMs: 'generating'이 이만큼 멈춰 있으면 다시 시작. failedCooldownMs: 실패한 지 이만큼 지나야 다시 시작(매 요청마다 AI를 다시 부르지 않게).
+ */
+export async function claimReportGeneration(resultId: string, staleMs = 5 * 60_000, failedCooldownMs = 60_000): Promise<string | null> {
+  const staleBefore = new Date(Date.now() - staleMs).toISOString();
+  const failedBefore = new Date(Date.now() - failedCooldownMs).toISOString();
+  const attempt = new Date().toISOString();
+  const { data, error } = await createAdminClient()
+    .from(TABLE)
+    .update({ report_status: "generating", report_started_at: attempt })
+    .eq("id", resultId)
+    .not("paid_at", "is", null)
+    .or(
+      `report_status.eq.none,and(report_status.eq.failed,report_started_at.is.null),and(report_status.eq.failed,report_started_at.lt.${failedBefore}),and(report_status.eq.generating,report_started_at.lt.${staleBefore})`,
+    )
+    .select("id");
+  if (error) throw new Error(`리포트 생성 시작 실패: ${error.code}`);
+  return (data?.length ?? 0) > 0 ? attempt : null;
+}
+
+/** 이번 시도(attempt)가 아직 자리를 갖고 있을 때만 저장. 저장했으면 true. */
+export async function saveReport(resultId: string, report: unknown | null, attempt?: string): Promise<boolean> {
+  let q = createAdminClient()
+    .from(TABLE)
+    .update(report ? { report, report_status: "ready" } : { report_status: "failed" })
+    .eq("id", resultId);
+  if (attempt) q = q.eq("report_started_at", attempt).eq("report_status", "generating");
+  const { data, error } = await q.select("id");
+  if (error) throw new Error(`리포트 저장 실패: ${error.code}`);
+  return (data?.length ?? 0) > 0;
+}
+
+/** 마지막으로 보던 장 저장(주인 확인). 칸이 없으면(마이그레이션 전) 조용히 넘어간다 — 이 기기 기억이 대신한다. */
+export async function saveLastPage(owner: Owner, id: string, page: number): Promise<void> {
+  const { error } = await byOwner(createAdminClient().from(TABLE).update({ last_page: page }), owner).eq("id", id);
+  if (error && error.code !== "42703") throw new Error(`마지막 장 저장 실패: ${error.code}`);
+}
+
+/** 쓰는 중인 리포트(다 쓴 파트까지)를 저장 — 아직 생성 중일 때만(끝난 리포트를 덮지 않게). 실패해도 던지지 않는다. */
+export async function savePartialReport(resultId: string, report: unknown, attempt?: string): Promise<void> {
+  let q = createAdminClient().from(TABLE).update({ report }).eq("id", resultId).eq("report_status", "generating");
+  if (attempt) q = q.eq("report_started_at", attempt);
+  const { error } = await q;
+  if (error) console.warn(`리포트 중간 저장 실패: ${error.code}`);
+}
+
+/** 쏘웰라 채팅용 요약 갱신(리포트가 생기면 본문·제안까지). 실패해도 던지지 않는다 — 부가 기능. */
+export async function saveChatSummary(resultId: string, summary: string | null): Promise<void> {
+  if (!summary) return;
+  const { error } = await createAdminClient().from(TABLE).update({ chat_summary: summary, chat_summary_at: new Date().toISOString() }).eq("id", resultId);
+  if (error) console.warn(`채팅 요약 저장 실패: ${error.code}`);
+}
+
+/** 결과의 태양 별자리(한국어 이름)와 닉네임 — 영문 주문 확인 메일의 그림·인사용. 없거나 실패하면 null */
+export async function getResultCard(resultId: string): Promise<{ sunSign: string; nickname: string } | null> {
+  const { data, error } = await createAdminClient().from(TABLE).select("sun_sign, nickname").eq("id", resultId).maybeSingle();
+  if (error || !data) return null;
+  return { sunSign: data.sun_sign as string, nickname: data.nickname as string };
+}
+
+export async function getResultForReport(resultId: string) {
+  const { data, error } = await createAdminClient()
+    .from(TABLE)
+    .select("id, user_id, nickname, birth_input, answers, report, report_status")
+    .eq("id", resultId)
+    .maybeSingle();
+  if (error) throw new Error(`결과 조회 실패: ${error.code}`);
+  return data as { id: string; user_id: string | null; nickname: string; birth_input: BirthInput; answers: Answers; report: unknown; report_status?: string } | null;
+}
+
+/**
+ * 리포트 완성 메일 보낼 자리를 잡는다(한 번만): report_emailed_at이 비어 있을 때만 채우고 true.
+ * 칸이 없으면(마이그레이션 20261011000100 전) false — 중복 메일보다 안 보내는 쪽을 택한다.
+ */
+export async function claimReportEmail(resultId: string): Promise<boolean> {
+  const { data, error } = await createAdminClient()
+    .from(TABLE)
+    .update({ report_emailed_at: new Date().toISOString() })
+    .eq("id", resultId)
+    .is("report_emailed_at", null)
+    .select("id");
+  if (error) {
+    console.warn("리포트 메일 자리 잡기 실패:", error.code);
+    return false;
+  }
+  return (data?.length ?? 0) > 0;
+}
+
+/** 보내는 데 실패하면 자리를 되돌려 다음 기회(재시도·다시 열기)에 보낼 수 있게 한다. */
+export async function releaseReportEmail(resultId: string): Promise<void> {
+  const { error } = await createAdminClient().from(TABLE).update({ report_emailed_at: null }).eq("id", resultId);
+  if (error) console.warn("리포트 메일 자리 되돌리기 실패:", error.code);
+}
+
+/** 계정의 메일 주소(이메일 가입·카카오는 email, 네이버는 이메일 없이 로그인해 user_metadata.contact_email). 없으면 null. */
+export async function getAccountEmail(userId: string): Promise<string | null> {
+  const { data, error } = await createAdminClient().auth.admin.getUserById(userId);
+  if (error || !data.user) return null;
+  // user_metadata는 사용자가 스스로 바꿀 수 있어(updateUser) 쓰지 않는다 — 계정 이메일, 없으면(네이버) 로그인 제공자가 준 정보만.
+  const fromIdentity = (data.user.identities ?? [])
+    .map((i) => (i.identity_data ?? {}) as Record<string, unknown>)
+    .map((d) => (typeof d.contact_email === "string" ? d.contact_email : typeof d.email === "string" ? d.email : ""))
+    .find((e) => e) ?? "";
+  const email = data.user.email || fromIdentity;
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) ? email : null;
+}
+
+/**
+ * 공유 링크 코드 기록(공유 버튼을 누를 때). 결과 id는 이 주인의 결과일 때만 남긴다.
+ * 'created' | 'duplicate'(같은 코드가 이미 있음) | 'unavailable'(표가 없음 — 마이그레이션 전).
+ */
+export async function insertShareLink(owner: Owner | null, slug: string, channel: ShareChannel, resultId: string | null): Promise<"created" | "duplicate" | "unavailable"> {
+  const db = createAdminClient();
+  let ownResult: string | null = null;
+  if (owner && resultId && isUuid(resultId)) {
+    let q = db.from(TABLE).select("id").eq("id", resultId);
+    q = owner.kind === "user" ? q.eq("user_id", owner.userId) : q.is("user_id", null).eq("guest_token_hash", owner.tokenHash);
+    const { data } = await q.maybeSingle();
+    ownResult = data ? resultId : null;
+  }
+  const who = !owner ? {} : owner.kind === "user" ? { user_id: owner.userId } : { guest_token_hash: owner.tokenHash };
+  const { error } = await db.from("astro_share_links").insert({ slug, channel, result_id: ownResult, ...who });
+  if (!error) return "created";
+  if (error.code === "23505") return "duplicate";
+  if (error.code === "42P01" || error.code === "PGRST205") return "unavailable";
+  throw new Error(`공유 링크 기록 실패: ${error.code}`);
+}

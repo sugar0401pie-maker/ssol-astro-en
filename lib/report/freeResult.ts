@@ -1,0 +1,784 @@
+// 무료 구간(1~3번 섹션) 화면 데이터 조립 — AI 호출 0회(마스터스펙 6-2), 문장은 전부 해석 DB(A1~A18, B1·B2·B6)에서.
+// 유료 섹션(4~7)은 제목만 보낸다 — 본문을 브라우저에 보내고 블러로 가리면 결제 없이 볼 수 있기 때문.
+// 출생차트의 모든 행성·하우스·각도 설명은 무료(2026-10-09 결정): 휠 탭 시트 전체 + 본문 '나의 행성 읽기'·'행성끼리의 관계'.
+// DB 문장의 토큰을 못 채우면 그 문장은 빼고 보여준다(fail safe) — 빈칸·괄호가 화면에 나가지 않게.
+import { withReportPrice } from "../billing/pricing.ts";
+import { DOMAIN_MAP, isSoftTone, type Answers, type Q2Word } from "../astro/answers.ts";
+import type { CharacterResult } from "../astro/character.ts";
+import { SHOW_CHARACTER, characterLabel } from "./characterDisplay.ts";
+import { CHARACTER_GRID, PLANET_KEYS, SIGNS, STYLES, STYLE_BY_ELEMENT, elementOf, type Element, type PointKey } from "../astro/constants.ts";
+import type { Accuracy, Longitudes, NatalChart } from "../astro/natal.ts";
+import {
+  buildTimeline, periodFilter, scoreInWindow, turningPoints, type ScoredEvent, type TimelineEvent,
+} from "../astro/timeline.ts";
+import { ingressLine } from "./ingress.ts";
+import { POINT_ID, SIGN_ID, ELEMENT_ID, aspectGroup, findRow, pad2, row, tryFill, type AstroDb } from "./db.ts";
+import { batchim } from "./format.ts";
+import { a12Variant, b11, fillSummary, hashPick } from "./variants.ts";
+import { pickTheme, themeScores, themeTable } from "./theme2026.ts";
+import { KO, lx, PLANET_NAME_EN, MODALITY_EN, SIGN_DATES_EN, type Lx, type ReportLang } from "./lang.ts";
+
+// 영문판 유료 섹션 제목(번역 묶음 UI의 섹션 제목 — 없으면 Claude 초안, 원어민 검수 대상)
+export const PAID_SECTION_TITLES_EN = [
+  { no: 4, title: "What to watch for until the end of the year" },
+  { no: 5, title: "Your mindset for 2027" },
+  { no: 6, title: "The next five years, {닉네임}: how your life may flow" },
+  { no: 7, title: "Questions from the stars and wellness suggestions" },
+] as const;
+
+export const PAID_SECTION_TITLES = [
+  { no: 4, title: "연말까지 조심하면 좋을 것" },
+  { no: 5, title: "2027년을 맞는 마음가짐" },
+  { no: 6, title: "앞으로 5년, {닉네임}님의 삶은 이렇게 흘러갈 거예요" },
+  { no: 7, title: "별이 주는 질문과 웰니스 제안" },
+] as const;
+
+/** 휠 탭 시트(프로토타입 planetSheet·signSheet·aspectSheet 그대로): 제목 + 작은 글씨 kicker + 문단(굵은 앞말 b가 있을 수 있음) */
+export interface WheelSheet {
+  title: string;
+  /** 별자리 시트 제목 앞 기호 */
+  glyph?: string;
+  kicker: string;
+  paras: Array<{ b?: string; t: string }>;
+  /** 작은 회색 줄(예: "이 칸에 있는 행성: …") */
+  muted?: string;
+}
+
+/** 휠 각도 선(프로토타입 topAspects: 합 제외, 행성끼리, 점수순 — 앞 8개만 처음에 보임) */
+export interface WheelAspect {
+  a: PointKey;
+  b: PointKey;
+  aspect: string;
+  orb: number;
+  harm: boolean;
+  /** '표로 보기' 각도 표의 뜻(B3 line_meaning) */
+  meaning: string;
+}
+
+export interface FreeResult {
+  dbVersion: string;
+  /** DB 상태가 DRAFT(상담사 검수 전)면 화면에 작게 표시 — 검수가 끝나 상태가 바뀌면 자동으로 사라진다. */
+  dbDraft: boolean;
+  /** 점성술이 처음인 사람에게 태양·달·상승궁 용어 한 줄 설명(A16, 마스터스펙 6-1 기타) */
+  terms: Array<{ name: string; line: string }>;
+  accuracy: Accuracy;
+  /** 결과 머리(프로토타입 res-head): "1996.04.01 10:17 · 경기" */
+  header: { title: string; line: string };
+  /** 출생 순간 역행 중인 행성 */
+  retro: PointKey[];
+  /** '표로 보기' 각주의 계산 시각 "UTC 1996-04-01 01:17" */
+  utcLabel: string;
+  /** 휠 각도 선(점수순) — 시트 키는 순서 번호 */
+  wheelAspects: WheelAspect[];
+  /** A등급 역량 동점: 2번 섹션 "요즘의 나와 더 가까운 건?" 두 카드(프로토타입 renderType). 아니면 null */
+  tie: { intro: string; options: Array<{ competency: string; style: string; card: string; selected: boolean }> } | null;
+  gradeNote: string;
+  /** B·C등급: "태어난 시간을 알면 더 정확해져요" 안내(A15 FIX_ADD_TIME) */
+  addTimeNote: string | null;
+  chart: NatalChart;
+  /** 4원소(프로토타입 renderSky): 가장 강한 원소(점 표시) + A7 문장(강할 때 1개 + 1점 이하인 원소의 부족할 때) */
+  elements: { strongest: Element; texts: string[] };
+  /** 휠 탭 시트. lines 키는 wheelAspects 순서 번호 */
+  wheelSheets: { planets: Partial<Record<PointKey, WheelSheet>>; signs: Record<string, WheelSheet>; lines: Record<string, WheelSheet> };
+  /** 처음인 사용자의 휠 3단계 안내 말풍선(A15 FIX_WHEEL_TIP_1~3) */
+  wheelTips: string[];
+  /** 섹션 1 '나의 행성 읽기'(수성~명왕성, B1a·B1b + B2a·B2b)와 '행성끼리의 관계'(주요 각도 3개, B3) — 무료 */
+  planetReading: {
+    head: string;
+    planets: Array<{ key: PointKey; title: string; shortLine: string; text: string; houseLine: string | null }>;
+    aspectsHead: string;
+    aspects: Array<{ title: string; sub: string; lineMeaning: string; text: string }>;
+  };
+  character: {
+    /** 굵은 한 줄 요약(B11 SUM_TYPE) */
+    summary: string | null;
+    /** 동물 이름 — SHOW_CHARACTER가 false면 null(브라우저에 보내지 않는다) */
+    name: string | null;
+    /** 유형 한 줄(A5 type_line) */
+    typeLine: string;
+    competency: string;
+    style: string;
+    why: string;
+    /** SHOW_CHARACTER일 때만(이야기형 소개·강점 등) */
+    intro: string | null;
+    strength: string | null;
+    energyMoment: string | null;
+    careTip: string | null;
+    sunMoonLine: string | null;
+    /** A6 역량·방식 쉬운 정의(유형 설명 바탕 — 마스터스펙 6장, 06 프롬프트 v3) */
+    competencyLine: string | null;
+    styleLine: string | null;
+    /** 2번 섹션 '웰니스 유형으로 분류하면…' 문단(A6 역량·방식 정의를 풀어 쓴 한 문단) */
+    wellnessLine: string | null;
+  };
+  big3: Array<{ key: "sun" | "moon" | "asc"; label: string; sign: string; house: number | null; line: string }>;
+  sunSign: string;
+  /** 휠 가운데 별자리 기호용(0=양자리) */
+  sunSignIndex: number;
+  /** 공유 이미지용 태양 별자리 소개(A1 one_liner·keywords) — 출생 정보 없이 별자리 이름과 소개만 */
+  sunSignIntro: { oneLiner: string; keywords: string } | null;
+  softTone: boolean;
+  year2026: {
+    /** 굵은 한 줄 요약(B11 SUM_2026) */
+    summary: string | null;
+    /** 분기 표 소제목(B11 HEAD_2026_Q) */
+    quarterHead: string;
+    intro: string;
+    /** A12d(단어 × 고민 영역) — 전환점 뒤 */
+    areaLine: string;
+    /** 2026 하늘 주제(A12t) */
+    theme: string;
+    turningPoints: string[];
+    quarters: Array<{ label: string; cell: string; reasons: Array<{ title: string; when: string; meaning: string }> }>;
+    closing: string;
+  };
+  /** 부드러운 톤(Q2 그만하자·이별·고생)일 때 결과 하단 카드 */
+  care: { note: string; card: string } | null;
+  /** 결제 팝업 문구(B11 PAY_POPUP, "안내 · 덧붙임 · [버튼]") */
+  payPopup: string;
+  /** 4~7번 페이지 공유 줄 위 안내(결제 전, B11 SHARE_NOTE_LOCKED) */
+  shareNoteLocked: string;
+  /** 저장·로그인 화면 문구(B11 SAVE_DONE·LOGIN_BIG·LOGIN_SMALL·LOGIN_DONE) */
+  saveCopy: { saveDone: string; loginBig: string; loginSmall: string; loginDone: string };
+  /** 임시 계정(로그인 안 함) 결제 안내(B11, 2026-10-10): 결제 팝업 아래 작은 글씨 · 결제 직후 리포트 위 배너 · 그때의 가입 화면 제목 */
+  tempPay: { note: string; banner: string; loginBigPaid: string };
+  disclaimer: string;
+  paidSections: typeof PAID_SECTION_TITLES | typeof PAID_SECTION_TITLES_EN;
+}
+
+const text = (db: AstroDb, table: string, id: string, col: string) => row(db, table, id)?.[col] ?? "";
+
+const BIG3_LABEL = { sun: "태양 (삶의 중심)", moon: "달 (감정의 욕구)", asc: "상승궁 (첫인상)" } as const;
+// 영문판 — 용어집(Sun/Moon/Ascendant) + 괄호 뜻은 Claude 초안(원어민 검수 대상)
+const BIG3_LABEL_EN = { sun: "Sun (your core)", moon: "Moon (emotional needs)", asc: "Ascendant (first impression)" } as const;
+/** 수호성(한국어 A1 ruler 칸 — 영문 DB에서는 비어 있어 한국어 DB 값으로 찾는다) */
+const RULER_KO: Record<string, string> = {
+  양자리: "화성", 황소자리: "금성", 쌍둥이자리: "수성", 게자리: "달", 사자자리: "태양", 처녀자리: "수성",
+  천칭자리: "금성", 전갈자리: "명왕성", 사수자리: "목성", 염소자리: "토성", 물병자리: "천왕성", 물고기자리: "해왕성",
+};
+const koRuler = (sign: string) => RULER_KO[sign] ?? "";
+const TERM_NAME_EN = { SUN: "Sun", MOON: "Moon", ASC: "Ascendant (rising sign)" } as const;
+
+// ---- 4원소 ----
+
+const ELEM_ORDER: readonly Element[] = ["불", "흙", "공기", "물"];
+
+/**
+ * 4원소 문장(프로토타입 renderSky 그대로): 가장 강한 원소 = 캐릭터 방식을 정한 원소가 최고점이면 그것, 아니면 불·흙·공기·물 순 첫 최고점.
+ * A7 '강할 때' 1개 + 점수가 1점 이하인 원소마다 '부족할 때'.
+ */
+export function elementTexts(db: AstroDb, elements: Record<Element, number>, dominant: Element): FreeResult["elements"] {
+  const max = Math.max(...ELEM_ORDER.map((e) => elements[e]));
+  const strongest = elements[dominant] === max ? dominant : ELEM_ORDER.find((e) => elements[e] === max)!;
+  const texts = [text(db, "A7", `ELEM_${ELEMENT_ID[strongest]}_STRONG`, "text")];
+  for (const e of ELEM_ORDER) if (elements[e] <= 1) texts.push(text(db, "A7", `ELEM_${ELEMENT_ID[e]}_WEAK`, "text"));
+  return { strongest, texts: texts.filter(Boolean) };
+}
+
+// ---- 휠 탭 시트 ----
+
+function planetSheet(db: AstroDb, key: PointKey, chart: NatalChart, retro: readonly PointKey[], L: Lx = KO): WheelSheet | null {
+  const p = chart.planets[key];
+  if (!p) return null;
+  const sid = SIGN_ID[p.sign];
+  const term = row(db, "A16", `TERM_${POINT_ID[key]}`);
+  const deg = `${L.sign(p.sign)} ${p.deg.toFixed(1)}°`;
+  if (key === "asc") {
+    return { title: `${L.lang === "en" ? "Ascendant" : "상승궁"} · ${L.sign(p.sign)} · ${L.house(1)}`, kicker: `${deg} — ${term ? `${term.nickname}: ${term.meaning_line}` : ""}`, paras: [{ t: text(db, "A4", `ASC_${sid}`, "text") }].filter((x) => x.t) };
+  }
+  if (key === "mc") {
+    return { title: `${L.lang === "en" ? "Midheaven" : "천정"} · ${L.sign(p.sign)} · ${L.house(p.house ?? 10)}`, kicker: deg, paras: term ? [{ t: `${term.meaning_line} ${term.detail}` }] : [] };
+  }
+  const title = `${L.point(key)} · ${L.sign(p.sign)}${p.house ? ` · ${L.house(p.house)}` : ""}`;
+  const kicker = `${deg}${retro.includes(key) ? ` · ${L.retro}` : ""}${term ? ` — ${term.nickname}: ${term.meaning_line}` : ""}`;
+  const paras: WheelSheet["paras"] = [];
+  if (key === "sun" || key === "moon") {
+    const t = text(db, key === "sun" ? "A2" : "A3", `${POINT_ID[key]}_${sid}`, "text");
+    if (t) paras.push({ t });
+    const b2 = p.house ? row(db, "B2a", `HS_${POINT_ID[key]}_H${pad2(p.house)}`) : null;
+    if (b2) paras.push({ t: `${b2.short_line} ${b2.text}` });
+    return { title, kicker, paras };
+  }
+  const outer = key === "uranus" || key === "neptune" || key === "pluto";
+  const b1 = row(db, outer ? "B1b" : "B1a", `PL_${POINT_ID[key]}_${sid}`);
+  if (b1) paras.push({ b: b1.short_line, t: b1.text });
+  const b2 = p.house ? row(db, key === "mercury" || key === "venus" || key === "mars" ? "B2a" : "B2b", `HS_${POINT_ID[key]}_H${pad2(p.house)}`) : null;
+  if (b2) paras.push({ b: L.house(p.house!), t: `· ${b2.short_line} ${b2.text}` });
+  return { title, kicker, paras };
+}
+
+/** A6 '쉬운 정의' 한 줄(역량·방식). */
+/**
+ * '웰니스 유형으로 분류하면…' 문단(owner 2026-10-10: 역량·방식 두 줄 대신 풀어 쓴 한 문단). A6 정의 문장에서
+ * 이름·어미를 떼어 잇는다 — 문장은 DB 그대로, 연결 말만 코드. 유형의 역량은 '힘이 많이 들어가는' 역량(가장 긴장을 받는
+ * 행성)이라 '높다'고 쓰지 않는다. 표현은 owner 2026-10-12(요약 '마음이 많이 쓰이고'·이유 '마음을 많이 쓰는'과 겹치지 않게). 형식이 맞지 않으면 null(그 문단을 빼고 보여 준다).
+ */
+export function wellnessTypeLine(db: AstroDb, competency: string, style: string, L: Lx = KO): string | null {
+  // 영문 A6 문장은 형식이 달라 이어 붙이지 않는다 — 영문판은 역량·방식 정의 두 줄을 그대로 보여 준다(화면 쪽)
+  if (L.lang === "en") return null;
+  const comp = a6Line(db, "역량", competency);
+  const sty = a6Line(db, "방식", style);
+  if (!comp || !sty) return null;
+  const strip = (t: string, head: string, tail: RegExp) => (t.startsWith(head) && tail.test(t) ? t.slice(head.length).replace(tail, "").trim() : null);
+  const compDesc = strip(comp, `${competency}는 `, /(입니다|이에요)\.$/) ?? strip(comp, `${competency}은 `, /(입니다|이에요)\.$/);
+  const styleDesc = strip(sty, `${style}는 마음이 흔들릴 때 `, /\s*방식(입니다|이에요)\.$/) ?? strip(sty, `${style}은 마음이 흔들릴 때 `, /\s*방식(입니다|이에요)\.$/);
+  if (!compDesc || !styleDesc) return null;
+  return `웰니스 유형으로 분류하면, ${compDesc}에 힘이 많이 들어가는 편이에요. 그리고 마음이 흔들릴 때는 ${styleDesc} 쪽을 고르는 성향입니다.`;
+}
+
+export function a6Line(db: AstroDb, kind: "역량" | "방식", name: string): string | null {
+  return findRow(db, "A6", (r) => r.kind === kind && r.name === name)?.plain || null;
+}
+
+/** 각도 선 시트 키 — 브라우저(BirthChartWheel)와 같은 규칙. */
+export function lineKey(a: string, b: string, aspect: string): string {
+  return `${a}|${b}|${aspect}`;
+}
+
+const ASPECT_TERM: Record<string, string> = { 합: "TERM_CONJ", 육분: "TERM_SEXTILE", 사각: "TERM_SQUARE", 삼분: "TERM_TRINE", 충: "TERM_OPPOSITION" };
+const GROUP_KO: Record<string, string> = { CONJ: "합", HARM: "조화", TENSE: "긴장" };
+const b3For = (db: AstroDb, a: PointKey, b: PointKey, aspect: string) => {
+  const g = aspectGroup(aspect);
+  return row(db, "B3", `ASP_${POINT_ID[a]}_${POINT_ID[b]}_${g}`) ?? row(db, "B3", `ASP_${POINT_ID[b]}_${POINT_ID[a]}_${g}`);
+};
+
+/** 휠 각도 선(프로토타입 topAspects): 합은 빼고, 행성끼리만, (무게 합) × 각도 무게 × (1 − 오브/6) 점수순 */
+export function wheelAspects(db: AstroDb, chart: NatalChart): WheelAspect[] {
+  return chart.aspects
+    .filter((a) => a.aspect !== "합" && READING_WEIGHT[a.a] && READING_WEIGHT[a.b])
+    .map((a) => ({ a, sc: (READING_WEIGHT[a.a]! + READING_WEIGHT[a.b]!) * READING_ASPECT_W[a.aspect] * (1 - a.orb / 6) }))
+    .sort((x, y) => y.sc - x.sc)
+    .map(({ a }) => ({ a: a.a, b: a.b, aspect: a.aspect, orb: a.orb, harm: a.aspect === "삼분" || a.aspect === "육분", meaning: b3For(db, a.a, a.b, a.aspect)?.line_meaning ?? "" }));
+}
+
+/** 각도 선 탭 시트(프로토타입 aspectSheet): B3 제목, kicker(두 행성 별자리·각도·오차 — 각도 별명), B3 두 줄 / 없으면 A16 각도 뜻 */
+function lineSheets(db: AstroDb, chart: NatalChart, list: WheelAspect[], L: Lx = KO): Record<string, WheelSheet> {
+  const out: Record<string, WheelSheet> = {};
+  list.forEach((a, i) => {
+    const r = b3For(db, a.a, a.b, a.aspect);
+    const ta = row(db, "A16", ASPECT_TERM[a.aspect]);
+    const kicker = `${L.point(a.a)} ${L.sign(chart.planets[a.a]?.sign ?? "")} · ${L.point(a.b)} ${L.sign(chart.planets[a.b]?.sign ?? "")} · ${L.aspect(a.aspect)} (${L.orb(a.orb)})${ta ? ` — ${ta.nickname}` : ""}`;
+    out[String(i)] = {
+      title: r ? r.title : L.pair(L.point(a.a), L.point(a.b), L.lang === "en" ? (aspectGroup(a.aspect) === "CONJ" ? "conjunction" : aspectGroup(a.aspect) === "HARM" ? "harmony" : "tension") : GROUP_KO[aspectGroup(a.aspect)]),
+      kicker,
+      paras: r ? [{ t: r.line_meaning }, { t: r.text }] : ta ? [{ t: ta.meaning_line }] : [],
+    };
+  });
+  return out;
+}
+
+const READING_PLANETS = ["mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune", "pluto"] as const;
+// 주요 각도 고르기(프로토타입 planetReading과 같은 규칙): (행성 무게 합) × 각도 무게 × (1 − 오브/6), B3 행이 있는 것만 3개.
+const READING_WEIGHT: Partial<Record<PointKey, number>> = { sun: 3, moon: 3, mercury: 2, venus: 2, mars: 2, jupiter: 1.5, saturn: 1.5, uranus: 1, neptune: 1, pluto: 1 };
+const READING_ASPECT_W: Record<string, number> = { 합: 1, 충: 0.9, 사각: 0.9, 삼분: 0.7, 육분: 0.5 };
+
+/** 섹션 1 '나의 행성 읽기'·'행성끼리의 관계'(2026-10-09, 마스터스펙 6-1-1). 하우스 문장은 A·B등급만. */
+export function planetReading(db: AstroDb, chart: NatalChart, L: Lx = KO): FreeResult["planetReading"] {
+  const planets = READING_PLANETS.flatMap((k) => {
+    const p = chart.planets[k];
+    if (!p) return [];
+    const sid = SIGN_ID[p.sign];
+    const outer = k === "uranus" || k === "neptune" || k === "pluto";
+    const b1 = row(db, outer ? "B1b" : "B1a", `PL_${POINT_ID[k]}_${sid}`);
+    const b2 = p.house ? row(db, k === "mercury" || k === "venus" || k === "mars" ? "B2a" : "B2b", `HS_${POINT_ID[k]}_H${pad2(p.house)}`) : null;
+    return [{
+      key: k as PointKey,
+      title: `${L.point(k)} · ${L.sign(p.sign)}${p.house ? ` · ${L.house(p.house)}` : ""}`,
+      shortLine: b1?.short_line ?? "",
+      text: b1?.text ?? "",
+      houseLine: b2 ? `${L.house(p.house!)} · ${b2.short_line}` : null,
+    }];
+  });
+  const group = (a: string) => (a === "합" ? "CONJ" : a === "삼분" || a === "육분" ? "HARM" : "TENSE");
+  const aspects = chart.aspects
+    .filter((a) => READING_WEIGHT[a.a] && READING_WEIGHT[a.b])
+    .map((a) => ({ a, sc: (READING_WEIGHT[a.a]! + READING_WEIGHT[a.b]!) * READING_ASPECT_W[a.aspect] * (1 - a.orb / 6) }))
+    .sort((x, y) => y.sc - x.sc)
+    .flatMap(({ a }) => {
+      const g = group(a.aspect);
+      const r = row(db, "B3", `ASP_${POINT_ID[a.a]}_${POINT_ID[a.b]}_${g}`) ?? row(db, "B3", `ASP_${POINT_ID[a.b]}_${POINT_ID[a.a]}_${g}`);
+      return r ? [{ title: r.title, sub: `${L.aspect(a.aspect)} · ${L.orb(a.orb)}`, lineMeaning: r.line_meaning, text: r.text }] : [];
+    })
+    .slice(0, 3);
+  return { head: b11(db, "HEAD_PLANETS"), planets, aspectsHead: b11(db, "HEAD_ASPECTS"), aspects };
+}
+
+/** 별자리 칸 탭 시트(프로토타입 signSheet): 기호+이름, kicker(기간·원소·양태·수호성·키워드), 한 줄·용어, (시간 앎) 하우스 뜻, 이 칸의 행성 */
+function signSheets(db: AstroDb, chart: NatalChart, L: Lx = KO): Record<string, WheelSheet> {
+  const out: Record<string, WheelSheet> = {};
+  const asc = chart.planets.asc;
+  SIGNS.forEach((sign, i) => {
+    const r = row(db, "A1", `SIGN_${SIGN_ID[sign]}`);
+    if (!r) return;
+    const paras: WheelSheet["paras"] = [{ t: r.one_liner }, { t: r.term_note }].filter((x) => x.t);
+    if (asc) {
+      const hn = (((i - SIGNS.indexOf(asc.sign)) % 12) + 12) % 12 + 1;
+      const t = row(db, "A16", `TERM_H${pad2(hn)}`);
+      if (t) paras.push({ b: `${L.house(hn)} · ${t.nickname}`, t: `— ${t.meaning_line}` });
+    }
+    const inside = PLANET_KEYS.filter((k) => chart.planets[k]?.sign === sign).map((k) => L.point(k));
+    out[sign] = {
+      title: L.sign(r.sign),
+      glyph: r.symbol,
+      kicker:
+        L.lang === "en"
+          ? `${SIGN_DATES_EN[sign]} · ${L.element(r.element)} · ${MODALITY_EN[row(db, "A1", `SIGN_${SIGN_ID[sign]}`)?.modality ?? ""] ?? ""} · ${L.rulerLabel} ${PLANET_NAME_EN[koRuler(sign)] ?? ""} · ${r.keywords}`
+          : `${r.dates} · ${r.element} · ${r.modality} · ${L.rulerLabel} ${r.ruler} · ${r.keywords}`,
+      paras,
+      muted: inside.length ? `${L.insideLabel}: ${inside.join(", ")}` : undefined,
+    };
+  });
+  return out;
+}
+
+// ---- 2026 회고 ----
+
+const HEAVY_WORDS: ReadonlySet<Q2Word> = new Set(["버텨", "고생", "그만하자", "멈춤", "이별"]);
+const LIGHT_WORDS: ReadonlySet<Q2Word> = new Set(["성취", "설렘", "시작", "배움", "감사"]);
+
+/** A8 행 ID(TR_{행성}_{대상}_{CONJ|HARM|TENSE}, 토성 리턴은 TR_SATURN_RETURN). 해당 행이 없으면 null. */
+export function a8Id(e: TimelineEvent): string | null {
+  if (e.kind !== "transit") return null;
+  if (e.milestone === "saturn_return") return "TR_SATURN_RETURN";
+  if (e.milestone) return null; // 목성 리턴 등은 A18 전환점 문장에만 있다
+  return `TR_${POINT_ID[e.transit]}_${POINT_ID[e.target]}_${aspectGroup(e.aspect)}`;
+}
+
+/**
+ * A12 도입문은 '하늘 흐름과 맞을 때(intro_match)'와 '엇갈릴 때(intro_differ)' 두 판이 있다. DB에 고르는 규칙이 없어
+ * Claude가 정한 규칙(owner 검토 가능): 2026년 상위 이벤트의 A8 톤(순풍/역풍)을 점수로 더해 하늘이 무거웠는지 본다.
+ *  - 무거운 단어(버텨·고생·그만하자·멈춤·이별) + 무거운 하늘 → 맞음, 가벼운 단어(성취·설렘·시작·배움) + 가벼운 하늘 → 맞음
+ *  - '변화'는 천왕성·명왕성·해왕성 이벤트나 별자리 이동(전환점)이 있으면 맞음
+ */
+export function q2Matches(word: Q2Word, top: ScoredEvent[], db: AstroDb, hasTurningPoint: boolean): boolean {
+  if (word === "변화") {
+    return hasTurningPoint || top.some((s) => s.event.kind === "transit" && ["uranus", "neptune", "pluto"].includes(s.event.transit));
+  }
+  let heavy = 0;
+  for (const s of top) {
+    const id = a8Id(s.event);
+    const tone = id ? row(db, "A8", id)?.tone : null;
+    if (tone === "역풍") heavy += s.score;
+    else if (tone === "순풍") heavy -= s.score;
+  }
+  if (HEAVY_WORDS.has(word)) return heavy > 0;
+  if (LIGHT_WORDS.has(word)) return heavy < 0;
+  return true;
+}
+
+/** 개인 트랜짓 전환점에서 보는 출생 지점 */
+const PERSONAL_TARGETS = new Set<string>(["sun", "moon", "asc", "mc"]);
+
+const TP_PLANET: Record<string, string> = { jupiter: "JUPITER", saturn: "SATURN", uranus: "URANUS", neptune: "NEPTUNE", pluto: "PLUTO" };
+
+/** 전환점 이벤트 → A18 행 ID와 우선순위(개인 이벤트가 먼저). 맞는 행이 없으면 null. */
+export function a18For(e: TimelineEvent, ascSign: string | null, birthYear: number): { id: string; personal: boolean } | null {
+  if (e.kind === "transit" && e.milestone) {
+    const year = Number((e.intervals[0].exact ?? e.intervals[0].from).slice(0, 4));
+    switch (e.milestone) {
+      case "saturn_return":
+        return { id: year - birthYear < 45 ? "TP_SATURN_RETURN_1" : "TP_SATURN_RETURN_2", personal: true };
+      case "jupiter_return":
+        return { id: "TP_JUPITER_RETURN", personal: true };
+      case "uranus_opposition":
+        return { id: "TP_URANUS_OPPOSITION", personal: true };
+      case "neptune_square":
+        return { id: "TP_NEPTUNE_SQUARE", personal: true };
+    }
+  }
+  if (e.kind === "chiron_return") return { id: "TP_CHIRON_RETURN", personal: true };
+  if (e.kind === "eclipse" && e.contact?.aspect === "합") {
+    return { id: e.eclipse === "solar" ? "TP_SOLAR_ECLIPSE_ON_POINT" : "TP_LUNAR_ECLIPSE_ON_POINT", personal: true };
+  }
+  if (e.kind === "ingress") {
+    if (ascSign && e.sign === ascSign && (e.planet === "uranus" || e.planet === "saturn")) {
+      return { id: `TP_${TP_PLANET[e.planet]}_INTO_ASC_SIGN`, personal: true };
+    }
+    const base = `TP_${TP_PLANET[e.planet]}_${SIGN_ID[e.sign]}`;
+    return { id: `${base}_${e.house ? "H" : "C"}`, personal: false };
+  }
+  return null;
+}
+
+/** 프로토타입(render2026)의 별자리 이동 전환점: 이 넷만, 우선순위 기본값 */
+const TP_INGRESS: Record<string, [string, number]> = {
+  "uranus|쌍둥이자리": ["URANUS_GEMINI", 60],
+  "saturn|양자리": ["SATURN_ARIES", 55],
+  "neptune|양자리": ["NEPTUNE_ARIES", 40],
+  "jupiter|사자자리": ["JUPITER_LEO", 45],
+};
+
+/**
+ * 올해의 전환점 문단(2026-10-09 프로토타입 render2026 그대로): 토성 리턴(100, 45세 전후로 1·2), 키론 리턴(95),
+ * 상승궁 별자리로 들어오는 천왕성·토성(90), 그 밖의 네 가지 별자리 이동(기본값 + 고민 영역 하우스면 +30).
+ * 우선순위 상위 2개 + 나머지 중 70 이상 1개, 날짜순. 하나도 없으면 TP_QUIET_YEAR.
+ * 프로토타입에 없는 나이 마일스톤(목성 리턴 80·천왕성 충 85·해왕성 사각 85)도 A18 행이 있어 같은 규칙에 넣었다
+ * (마스터스펙 6-2 '나이 마일스톤 포함' — Claude 판단, owner 검토 가능).
+ */
+export function turningPointTexts(db: AstroDb, events: TimelineEvent[], chart: NatalChart, birthYear: number, opts: { birthDate?: string; domainHouses?: number[]; today?: string; L?: Lx } = {}): string[] {
+  const L = opts.L ?? KO;
+  const ascSign = chart.planets.asc?.sign ?? null;
+  const timed = !!ascSign;
+  const houseArea = (h: number) => (L.lang === "en" ? L.houseArea(text(db, "A16", `TERM_H${pad2(h)}`, "nickname").toLowerCase(), h) : L.houseArea(text(db, "A16", `TERM_H${pad2(h)}`, "nickname"), h));
+  const ageAt = (date: string) => {
+    if (!opts.birthDate) return Number(date.slice(0, 4)) - birthYear;
+    const [by, bm, bd] = opts.birthDate.split("-").map(Number);
+    const [y, m, d] = date.split("-").map(Number);
+    return y - by - (m < bm || (m === bm && d < bd) ? 1 : 0);
+  };
+  const tps: Array<{ pri: number; date: string; text: string | null; gen?: boolean }> = [];
+  const in2026 = (d?: string) => !!d && d.startsWith("2026") && d !== "2026-01-01";
+  for (const e of events) {
+    if (e.kind === "transit" && e.milestone) {
+      const date = e.intervals.find((iv) => in2026(iv.exact))?.exact;
+      if (!date) continue;
+      const m = e.milestone;
+      const [id, pri] =
+        m === "saturn_return" ? [ageAt(date) < 45 ? "TP_SATURN_RETURN_1" : "TP_SATURN_RETURN_2", 100] : m === "jupiter_return" ? ["TP_JUPITER_RETURN", 80] : m === "uranus_opposition" ? ["TP_URANUS_OPPOSITION", 85] : ["TP_NEPTUNE_SQUARE", 85];
+      tps.push({ pri: pri as number, date, text: tryFill(text(db, "A18", id as string, "text"), { 날짜: L.date(date) }) });
+    } else if (e.kind === "chiron_return") {
+      const date = e.intervals.find((iv) => iv.exact?.startsWith("2026"))?.exact;
+      if (date) tps.push({ pri: 95, date, text: tryFill(text(db, "A18", "TP_CHIRON_RETURN", "text"), { 날짜: L.date(date) }) });
+    }
+  }
+  const seen = new Set<string>();
+  for (const e of events
+    .filter((x): x is Extract<TimelineEvent, { kind: "ingress" }> => x.kind === "ingress" && x.intervals[0].from.startsWith("2026"))
+    .sort((a, b) => (a.intervals[0].from < b.intervals[0].from ? -1 : 1))) {
+    const key = `${e.planet}|${e.sign}`;
+    if (!TP_INGRESS[key] || seen.has(key)) continue;
+    seen.add(key);
+    const date = e.intervals[0].from;
+    let id: string;
+    let pri: number;
+    if (timed && (e.planet === "uranus" || e.planet === "saturn") && e.sign === ascSign) {
+      id = `TP_${e.planet === "uranus" ? "URANUS" : "SATURN"}_INTO_ASC_SIGN`;
+      pri = 90;
+    } else {
+      id = `TP_${TP_INGRESS[key][0]}_${timed ? "H" : "C"}`;
+      // 패키지 v3: 고민 영역 하우스 가산 30 → 15(개인 트랜짓이 모두에게 같은 별자리 이동보다 앞서게)
+      pri = TP_INGRESS[key][1] + (timed && e.house && (opts.domainHouses ?? []).includes(e.house) ? 15 : 0);
+    }
+    tps.push({ pri, date, gen: pri < 90, text: tryFill(text(db, "A18", id, "text"), { 날짜: L.date(date), 별자리: L.sign(e.sign), 하우스영역: e.house ? houseArea(e.house) : "", 행성: L.point(e.planet) }) });
+  }
+  // 개인 트랜짓(TP_PERSONAL, 패키지 v3 2026-10-10): 출생 태양·달·상승궁·천정과 맺은 각도로 2026년(오늘까지) 정확한 날이 있는 것.
+  // 토성 긴장 80/조화 60, 천왕성·해왕성·명왕성 긴장 85/조화 65, 목성 사각·충 55/그 밖 72. 행성마다 하나만.
+  const today = opts.today ?? "9999-12-31";
+  const pers: Array<{ pri: number; date: string; text: string; pl: string }> = [];
+  for (const e of events) {
+    if (e.kind !== "transit" || e.milestone || !PERSONAL_TARGETS.has(e.target)) continue;
+    const date = e.intervals.find((iv) => in2026(iv.exact) && iv.exact! <= today)?.exact;
+    if (!date) continue;
+    const hard = e.aspect === "합" || e.aspect === "사각" || e.aspect === "충";
+    const outer = e.transit === "uranus" || e.transit === "neptune" || e.transit === "pluto";
+    const pri = e.transit === "saturn" ? (hard ? 80 : 60) : outer ? (hard ? 85 : 65) : e.transit === "jupiter" ? (e.aspect === "사각" || e.aspect === "충" ? 55 : 72) : 0;
+    if (!pri) continue;
+    const id = a8Id(e);
+    const a8 = id ? row(db, "A8", id) : null;
+    if (!a8?.table_past) continue;
+    const head = String(a8.meaning_line ?? "").split(" — ")[0].trim();
+    if (!head) continue;
+    pers.push({ pri, date, pl: e.transit, text: L.personalTurn(date, head, a8.table_past) });
+  }
+  const usedPl = new Set<string>();
+  for (const t of pers.sort((a, b) => b.pri - a.pri)) {
+    if (usedPl.has(t.pl)) continue;
+    usedPl.add(t.pl);
+    tps.push({ pri: t.pri, date: t.date, text: t.text, gen: false });
+  }
+  const ok = tps.filter((t) => t.text).sort((a, b) => b.pri - a.pri);
+  const pick = [...ok.slice(0, 2), ...ok.slice(2).filter((t) => t.pri >= 70).slice(0, 1)];
+  // 개인 사건이 하나라도 있으면 최소 하나는 넣는다
+  if (!pick.some((t) => !t.gen)) {
+    const bp = ok.find((t) => !t.gen);
+    if (bp) pick[pick.length > 1 ? 1 : 0] = bp;
+  }
+  pick.sort((a, b) => (a.date < b.date ? -1 : 1));
+  return pick.length ? pick.map((t) => t.text!) : [text(db, "A18", "TP_QUIET_YEAR", "text")].filter(Boolean);
+}
+
+
+export function buildFreeResult(args: {
+  db: AstroDb;
+  chart: NatalChart;
+  longitudes: Longitudes;
+  character: CharacterResult;
+  answers: Answers;
+  nickname: string;
+  birthYear: number;
+  /** 표현 변형을 고르는 출생정보 해시 열쇠(variants.ts birthKeyOf). 없으면 원래 문장(A12 1번)만 */
+  birthKey?: string;
+  /** 현지 출생일 'YYYY-MM-DD' — 키론 리턴(2026 전환점) 계산용. 없으면 키론은 빠진다 */
+  birthDate?: string;
+  /** 결과 머리 줄(프로토타입 res-head, 예: "1996.04.01 10:17 · 경기") */
+  birthLine?: string;
+  /** 출생 순간 역행 중인 행성(natal.ts retrogradeAt) */
+  retro?: PointKey[];
+  /** 출생 시각 UTC(ISO) — '표로 보기' 각주 */
+  utc?: string;
+  /** 정확한 시각이 서머타임 경계(없는/두 번 있는 시각)면 정확도 B로 표시(17_해외도시 ③) */
+  dstBoundary?: "gap" | "ambiguous";
+  now?: Date;
+  /** 영문판(2026-11-04): en이면 영문 DB(db 인자)와 영문 연결 말을 쓴다 */
+  lang?: ReportLang;
+}): FreeResult {
+  const { db, chart, longitudes, character, answers, nickname, birthYear } = args;
+  const L = lx(args.lang);
+  const today = new Date((args.now ?? new Date()).getTime() + 9 * 3_600_000).toISOString().slice(0, 10);
+  const nick = { 닉네임: nickname };
+  const w = { start: "2026-01-01", end: "2026-12-31" };
+  const events = buildTimeline(longitudes, w, undefined, { birthDate: args.birthDate });
+
+  // 2026 분기별 표(프로토타입 render2026): 1~3분기는 그 분기에 정확한 날이 있는 느린 행성 트랜짓 중 점수 1위의 A8 table_past
+  // (없으면 A11 SKY_05), 4분기는 지금 지나고 있는 분기라 '연말까지' 섹션으로 잇는 문장. 접힌 근거는 1~3분기: 상위 4개 + 그 분기 별자리 이동.
+  const scored = scoreInWindow(events.filter((e) => periodFilter("year2026", e) || e.kind === "eclipse"), w, answers.q1);
+  const slowScored = scoreInWindow(
+    events.filter((e) => e.kind === "transit" && ["jupiter", "saturn", "uranus", "neptune", "pluto"].includes(e.transit) && (e.milestone === null || e.milestone === "saturn_return")),
+    w,
+    answers.q1,
+  );
+  const exactOf = (s: ScoredEvent) => s.event.intervals.find((iv) => iv.exact && iv.exact.startsWith("2026") && iv.exact !== "2026-01-01")?.exact ?? null;
+  const qOf = (d: string) => Math.floor((Number(d.slice(5, 7)) - 1) / 3) + 1;
+  const quarters = [1, 2, 3, 4].map((qn) => {
+    const qEnd = ["2026-03-31", "2026-06-30", "2026-09-30", "2026-12-31"][qn - 1];
+    const list = slowScored.filter((s) => {
+      const d = exactOf(s);
+      return d && qOf(d) === qn;
+    });
+    if (qn === 4 && today <= qEnd) {
+      return { label: L.quarter[3], cell: L.quarterNow, reasons: [] };
+    }
+    const top = list[0];
+    const id = top ? a8Id(top.event) : null;
+    const cell = (id && text(db, "A8", id, "table_past")) || text(db, "A11", "SKY_05", "common_line") || "—";
+    const reasons = list.slice(0, 4).map((s) => {
+      const d = exactOf(s)!;
+      const e = s.event as Extract<TimelineEvent, { kind: "transit" }>;
+      const a8 = a8Id(e) ? row(db, "A8", a8Id(e)!) : null;
+      return { iso: d, title: e.milestone === "saturn_return" ? L.saturnReturn : L.pair(L.point(e.transit), L.point(e.target), L.aspect(e.aspect)), when: L.date(d), meaning: a8?.meaning_line ?? "" };
+    });
+    for (const e of events) {
+      if (e.kind !== "ingress" || !e.intervals[0].from.startsWith("2026") || qOf(e.intervals[0].from) !== qn) continue;
+      const d = e.intervals[0].from;
+      reasons.push({ iso: d, title: L.ingress(L.point(e.planet), L.sign(e.sign), e.house), when: L.date(d), meaning: ingressLine(db, e.planet, e.house) });
+    }
+    reasons.sort((a, b) => (a.iso < b.iso ? -1 : 1));
+    return { label: L.quarter[qn - 1], cell, reasons: reasons.map(({ title, when, meaning }) => ({ title, when, meaning })) };
+  });
+
+  const tps = turningPointTexts(db, events, chart, birthYear, { birthDate: args.birthDate, domainHouses: DOMAIN_MAP[answers.q1].houses, today, L });
+  const q2 = findRow(db, "A12", (r) => r.word === answers.q2);
+  const hasTp = turningPoints(events, w).length > 0;
+  const match = q2Matches(answers.q2, scored.slice(0, 5), db, hasTp);
+  // 해석 DB v1.3: 2026 하늘 주제(A12t 규칙) → 첫 문단 A12c(단어 × 주제), 전환점 뒤에 A12d(단어 × 고민 영역). 칸 안 표현은 출생정보 해시로 하나.
+  const themes = themeTable(db);
+  const picked = pickTheme(themeScores(events, longitudes), answers.q2, themes);
+  const pick3 = (table: "A12c" | "A12d", match: (r: Record<string, string>) => boolean, salt: string) => {
+    const rows = (db.dbs[table]?.rows ?? []).filter(match).sort((a, b) => Number(a.variant) - Number(b.variant));
+    if (!rows.length) return null;
+    return rows[args.birthKey ? hashPick(args.birthKey, rows.length, salt) : 0].text;
+  };
+  const themeIntro = pick3("A12c", (r) => r.word === answers.q2 && r.theme === themes[picked.theme]?.name, `A12c${answers.q2}${picked.theme}`);
+  const areaLine = pick3("A12d", (r) => r.word === answers.q2 && r.area === answers.q1, `A12d${answers.q2}${answers.q1}`);
+
+  // 가장 강한 원소: 4개 중 1등 원소가 아닌 방식을 골랐으면(owner 2026-10-11) 고른 방식이 아니라 실제 1등 원소(strong_element)
+  const dominant = character.strong_element ?? (Object.keys(STYLE_BY_ELEMENT) as Element[]).find((e) => STYLE_BY_ELEMENT[e] === character.style)!;
+  const sunSign = chart.planets.sun!.sign;
+  const moonSign = chart.planets.moon!.sign;
+  const temp = row(db, "A17b", `TEMP_${ELEMENT_ID[elementOf(longitudes.sun)]}_${ELEMENT_ID[elementOf(longitudes.moon)]}`);
+  const charRow = db.dbs.A5.rows.find((r) => r.character === character.name)!;
+
+  const retro = args.retro ?? [];
+  const planets: FreeResult["wheelSheets"]["planets"] = {};
+  for (const k of Object.keys(chart.planets) as PointKey[]) {
+    const sh = planetSheet(db, k, chart, retro, L);
+    if (sh) planets[k] = sh;
+  }
+  const wAspects = wheelAspects(db, chart);
+
+  const soft = isSoftTone(answers.q2);
+  return {
+    dbVersion: db.version,
+    dbDraft: db.status.startsWith("DRAFT"),
+    terms: (["SUN", "MOON", "ASC"] as const)
+      .filter((k) => k !== "ASC" || chart.planets.asc)
+      .map((k) => ({ name: L.lang === "en" ? TERM_NAME_EN[k] : text(db, "A16", `TERM_${k}`, "name"), line: text(db, "A16", `TERM_${k}`, "meaning_line") })),
+    accuracy: args.dstBoundary && chart.accuracy === "A" ? "B" : chart.accuracy,
+    header: { title: L.reportTitle(nickname), line: args.birthLine ?? "" },
+    retro,
+    utcLabel: args.utc ? `UTC ${args.utc.slice(0, 16).replace("T", " ")}` : "",
+    wheelAspects: wAspects,
+    // 4개 중 고르기(owner 2026-10-11): 역량 2 × 방식 2. 카드는 해석 DB B6(유형별 '요즘 나는…' 문장).
+    tie: character.options?.length
+      ? {
+          intro: L.lang === "en" ? TYPE_CHOICE_INTRO_EN : TYPE_CHOICE_INTRO,
+          options: character.options.map((o) => ({
+            competency: o.competency,
+            style: o.style,
+            card: db.dbs.B6.rows.find((r) => r.character === CHARACTER_GRID[o.competency][STYLES.indexOf(o.style)])?.choice_line ?? "",
+            selected: o.competency === character.competency && o.style === character.style,
+          })),
+        }
+      : null,
+    gradeNote:
+      args.dstBoundary && chart.accuracy === "A"
+        ? // 서머타임 경계: 계산은 입력한 시각 그대로(첫 번째 해석) 하되 1시간 안의 차이를 알린다 — 안내 문장은 Claude 초안(owner 검토 가능)
+          L.dst(args.dstBoundary)
+        : text(db, "A15", `FIX_GRADE_${chart.accuracy}`, "text"),
+    addTimeNote: chart.accuracy === "A" ? null : text(db, "A15", "FIX_ADD_TIME", "text").replace(/\s*→\s*\[.*\]\s*$/, ""),
+    chart,
+    elements: elementTexts(db, chart.elements, dominant),
+    wheelSheets: { planets, signs: signSheets(db, chart, L), lines: lineSheets(db, chart, wAspects, L) },
+    wheelTips: [1, 2, 3].map((i) => text(db, "A15", `FIX_WHEEL_TIP_${i}`, "text")).filter(Boolean),
+    planetReading: planetReading(db, chart, L),
+    character: {
+      // owner 2026-10-10: B11 SUM_TYPE에서 '별이 본'과 '(역량 × 방식)'을 뺀 줄 — "{태양별자리} · {닉네임}님은 {유형문장}입니다."
+      // (엑셀 B11 SUM_TYPE도 같은 문장으로 고치면 코드와 맞는다)
+      summary: charRow.type_line ? L.typeSummary(L.sign(sunSign), nickname, charRow.type_line) : null,
+      name: SHOW_CHARACTER ? character.name : null,
+      typeLine: charRow.type_line,
+      competency: character.competency,
+      style: character.style,
+      why: L.lang === "en" ? whyWithSourceEn(charRow.why_text, character) : whyWithSource(charRow.why_text, character),
+      intro: SHOW_CHARACTER ? charRow.intro : null,
+      strength: SHOW_CHARACTER ? charRow.strength : null,
+      energyMoment: SHOW_CHARACTER ? charRow.energy_moment : null,
+      careTip: SHOW_CHARACTER ? charRow.care_tip : null,
+      sunMoonLine: tryFill(temp?.sun_moon_line, { 태양별자리: L.sign(sunSign), 달별자리: L.sign(moonSign) }),
+      competencyLine: a6Line(db, "역량", character.competency),
+      styleLine: a6Line(db, "방식", character.style),
+      wellnessLine: wellnessTypeLine(db, character.competency, character.style, L),
+    },
+    big3: (["sun", "moon", "asc"] as const)
+      .filter((k) => chart.planets[k])
+      .map((k) => ({
+        key: k,
+        label: (L.lang === "en" ? BIG3_LABEL_EN : BIG3_LABEL)[k],
+        sign: L.sign(chart.planets[k]!.sign),
+        house: chart.planets[k]!.house ?? null,
+        line: text(db, k === "sun" ? "A2" : k === "moon" ? "A3" : "A4", `${POINT_ID[k]}_${SIGN_ID[chart.planets[k]!.sign]}`, "table_line"),
+      })),
+    sunSign,
+    sunSignIndex: SIGNS.indexOf(sunSign as (typeof SIGNS)[number]),
+    sunSignIntro: (() => {
+      const r = row(db, "A1", `SIGN_${SIGN_ID[sunSign as (typeof SIGNS)[number]]}`);
+      return r ? { oneLiner: r.one_liner, keywords: r.keywords } : null;
+    })(),
+    softTone: soft,
+    year2026: {
+      summary: fillSummary(b11(db, "SUM_2026"), nick),
+      quarterHead: b11(db, "HEAD_2026_Q"),
+      // A12/A12b intro_match·intro_differ는 주제 문장이 없을 때 쓰는 대체 문장(A12t RULE_ORDER)
+      intro:
+        themeIntro ?? (q2 && tryFill(args.birthKey ? a12Variant(db, q2, match ? "intro_match" : "intro_differ", args.birthKey) : q2[match ? "intro_match" : "intro_differ"], nick)) ?? "",
+      areaLine: areaLine ?? "",
+      theme: picked.theme,
+      turningPoints: tps.map((t) => tryFill(t, nick)).filter((x): x is string => !!x),
+      quarters,
+      closing: (q2 && tryFill(args.birthKey ? a12Variant(db, q2, "closing", args.birthKey) : q2.closing, nick)) ?? "",
+    },
+    care: soft
+      ? { note: q2?.care_note ?? "", card: text(db, "A15", "FIX_CARE_CARD", "text").replace(/\s*→\s*\[.*\]\s*$/, "") }
+      : null,
+    payPopup: withReportPrice(b11(db, "PAY_POPUP")), // 금액 글자는 실제 가격으로(owner 2026-10-12 A)
+    shareNoteLocked: b11(db, "SHARE_NOTE_LOCKED"),
+    saveCopy: {
+      saveDone: b11(db, "SAVE_DONE"),
+      // 패키지 v3: LOGIN_BIG·LOGIN_SMALL은 테스트 시작 로그인 화면 문구로 바뀌었다 — 결과의 [저장하기]에는 저장용 문구
+      loginBig: fillSummary(b11(db, "LOGIN_BIG_SAVE"), { 닉네임: nickname }) ?? "",
+      loginSmall: b11(db, "LOGIN_SMALL_GUEST"),
+      loginDone: b11(db, "LOGIN_DONE"),
+    },
+    tempPay: {
+      note: b11(db, "PAY_TEMP_NOTE"),
+      // 버튼 표기 "[회원가입하고 보관하기]"는 화면 버튼으로 따로 그린다
+      banner: b11(db, "PAY_TEMP_BANNER").replace(/\s*\[[^\]]*\]\s*$/, ""),
+      loginBigPaid: fillSummary(b11(db, "LOGIN_BIG_PAID"), { 닉네임: nickname }) ?? "",
+    },
+    disclaimer: text(db, "A15", "FIX_DISCLAIMER", "text"),
+    paidSections: L.lang === "en" ? PAID_SECTION_TITLES_EN : PAID_SECTION_TITLES,
+  };
+}
+
+/** 후보 선택 화면(B6 카드 + A15 안내). */
+export function candidateCards(db: AstroDb, names: string[]): { intro: string; cards: Record<string, string>; labels: Record<string, string> } {
+  const cards: Record<string, string> = {};
+  const labels: Record<string, string> = {};
+  for (const n of names) {
+    cards[n] = db.dbs.B6.rows.find((r) => r.character === n)?.choice_line ?? "";
+    labels[n] = characterLabel(db, n);
+  }
+  return { intro: text(db, "A15", "FIX_CANDIDATE_CHOICE", "text"), cards, labels };
+}
+
+/** 역량 동점 확인 화면(A15 FIX_TIE_CHOICE + 두 유형의 B6 카드). 동물 이름은 보내지 않는다(SHOW_CHARACTER). */
+export function tieOptions(db: AstroDb, c: CharacterResult): { intro: string; options: Array<{ competency: string; style: string; label: string; card: string }> } {
+  const opts = [c.competency, c.runner_up].map((comp) => {
+    const name = CHARACTER_GRID[comp][STYLES.indexOf(c.style)];
+    return {
+      competency: comp,
+      style: c.style,
+      label: characterLabel(db, name),
+      card: db.dbs.B6.rows.find((r) => r.character === name)?.choice_line ?? "",
+    };
+  });
+  return { intro: text(db, "A15", "FIX_TIE_CHOICE", "text"), options: opts };
+}
+
+/** 4개 중 고르기 안내(Claude 초안 — owner 검토 가능, 해석 DB A15 FIX_TIE_CHOICE는 '두 캐릭터' 문구라 쓰지 않음) */
+export const TYPE_CHOICE_INTRO = "출생차트에서 비슷한 무게로 나온 모습을 네 가지로 나눠 봤어요. 요즘의 나와 가장 가까운 모습을 골라 주세요.";
+/** 영문(Claude 초안 — 원어민 검수 대상) */
+export const TYPE_CHOICE_INTRO_EN = "Your birth chart shows four sides of you with similar weight. Pick the one that feels most like you lately.";
+
+/**
+ * '왜 이 유형인가' 마지막 문장 바꾸기(A5c, owner 확정 2026-10-12 — `docs/spec/11_해석DB/변경_A5c_근거문장.json`의 text 그대로,
+ * 끝의 "입니다."만 떼어 원래 문장 어미(입니다/이에요)를 살린다. 문구가 바뀌면 그 JSON과 이 표를 함께 고친다 — 테스트가 비교함).
+ */
+export const STYLE_WHY_TEMPLATES = {
+  time: "태어난 시간에 따라 달의 자리가 바뀌어, 하루 중 어느 때는 {{고른원소}}의 기운이 가장 강해지기 때문",
+  sun: "차트에서 가장 강한 기운은 {{원소1:이지만/지만}}, 태양이 놓인 {{고른원소}}의 기운이 마음이 흔들리는 순간에 앞으로 나오기 때문",
+  second: "차트에서 {{원소1}} 다음으로 강한 {{고른원소}}의 기운이 마음이 흔들리는 순간에 앞으로 나오기 때문",
+  other: "차트에서 가장 강한 기운은 {{원소1:이지만/지만}}, 함께 자리한 {{고른원소}}의 기운이 마음이 흔들리는 순간에 앞으로 나오기 때문",
+  zero: "차트에는 {{고른원소}}의 기운이 거의 없지만, 마음이 흔들리는 순간에는 부족한 쪽을 채우려는 마음이 앞으로 나오기 때문",
+} as const;
+
+const fillWhy = (t: string, strong: string, picked: string) =>
+  t
+    .replaceAll("{{원소1:이지만/지만}}", `${strong}${batchim(strong)?.has ? "이지만" : "지만"}`)
+    .replaceAll("{{원소1}}", strong)
+    .replaceAll("{{고른원소}}", picked);
+
+/**
+ * '왜 이 유형인가'(A5 why_text) 마지막 문장은 "…것은, 차트에서 {원소}의 기운이 가장 강하기 때문입니다/이에요."로 끝난다.
+ * 4개 중 1등 원소가 아닌 방식을 골랐으면 그 부분이 사실과 달라지므로 출처에 맞는 A5c 문장으로 바꾼다.
+ */
+export function whyWithSource(why: string, c: Pick<CharacterResult, "style" | "style_source" | "strong_element">): string {
+  if (!c.style_source || c.style_source === "dominant") return why;
+  const el = (Object.keys(STYLE_BY_ELEMENT) as Element[]).find((e) => STYLE_BY_ELEMENT[e] === c.style)!;
+  const strong = c.strong_element ?? el;
+  const template = STYLE_WHY_TEMPLATES[c.style_source];
+  return why.replace(/차트에서 (불|흙|공기|물)의 기운이 가장 강하기 때문(입니다|이에요)\.?\s*$/, (_m, _e, end: string) => `${fillWhy(template, strong, el)}${end}.`);
+}
+
+/**
+ * 영문 '왜 이 유형인가': 영문 A5 why_text는 원소 문장이 문장 중간에 있어 한국어처럼 끝부분만 바꿀 수 없다.
+ * 1등 원소가 아닌 방식을 골랐으면 원소를 말하는 문장을 빼고 출처 문장(A5c 영문, Claude 초안 — 원어민 검수 대상)을 덧붙인다.
+ */
+export const STYLE_WHY_EN = {
+  time: "Your Moon shifts sign depending on your birth time, so at some hours of the day {picked} becomes the strongest energy.",
+  sun: "The strongest energy in your chart is {strong}, but the {picked} energy of your Sun steps forward when you feel unsettled.",
+  second: "After {strong}, {picked} is the next strongest energy in your chart, and it steps forward when you feel unsettled.",
+  other: "The strongest energy in your chart is {strong}, but the {picked} energy beside it steps forward when you feel unsettled.",
+  zero: "There is little {picked} in your chart, yet when you feel unsettled, the wish to fill what's missing steps forward.",
+} as const;
+
+export function whyWithSourceEn(why: string, c: Pick<CharacterResult, "style" | "style_source" | "strong_element">): string {
+  if (!why || !c.style_source || c.style_source === "dominant") return why;
+  const el = (Object.keys(STYLE_BY_ELEMENT) as Element[]).find((e) => STYLE_BY_ELEMENT[e] === c.style)!;
+  const strong = c.strong_element ?? el;
+  const EN_EL: Record<string, string> = { 불: "Fire", 흙: "Earth", 공기: "Air", 물: "Water" };
+  const sentences = why.match(/[^.!?]+[.!?]+(\s|$)/g) ?? [why];
+  const kept = sentences.filter((x) => !/\b(Fire|Earth|Air|Water)\b/.test(x)).join("").trim();
+  const add = STYLE_WHY_EN[c.style_source].replace("{strong}", EN_EL[strong]).replace("{picked}", EN_EL[el]);
+  return `${kept} ${add}`.trim();
+}
